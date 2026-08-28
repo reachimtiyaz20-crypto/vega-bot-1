@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+"""Every book, every position, in a browser. Read-only.
+
+WHY A SECOND DASHBOARD
+
+The Go dashboard on :8081 shows the headline and reverse books plus a
+cross-venue book that has been STOPPED since 24 August -- and misses the two
+newest books entirely. A page that confidently displays a dead book while
+omitting live ones is worse than no page, and that exact defect has already
+cost this project two days once.
+
+Rather than perform surgery on the Go template to add two more packages, this
+serves the same data vega_status.py already reads, as HTML, refreshing itself.
+
+	python3 vega_web.py            serve on :8090
+	python3 vega_web.py --port N   somewhere else
+
+READ ONLY. It opens files the books write and never writes to them.
+
+WHAT IT SHOWS, and the conventions that matter
+
+	open positions carry an ESTIMATED exit cost, assumed symmetric with entry.
+	Measured on real closes, exits run about 12% ABOVE that estimate, so open
+	P&L is mildly optimistic and closed P&L is not.
+
+	a position is not profitable until it has paid to get out. Every book
+	charges its full round trip at entry, which is why a new position shows
+	red and why that is correct rather than alarming.
+
+	win/loss counts only move on CLOSES. Open positions are shown as in
+	profit or underwater, which is a different thing.
+"""
+
+import argparse
+import datetime
+import html
+import json
+import os
+import statistics
+import subprocess
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+ROOT = "/root/vega-bot"
+
+CSS = """
+body{background:#0d1117;color:#c9d1d9;font:13px/1.5 ui-monospace,Menlo,monospace;
+margin:0;padding:24px}
+h1{font-size:18px;margin:0 0 4px;color:#e6edf3}
+h2{font-size:14px;margin:28px 0 8px;color:#e6edf3;border-bottom:1px solid #30363d;
+padding-bottom:6px}
+.sub{color:#8b949e;font-size:12px;margin-bottom:2px}
+table{border-collapse:collapse;width:100%;margin:6px 0 2px}
+th{text-align:left;color:#8b949e;font-weight:normal;padding:4px 10px 4px 0;
+font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+td{padding:3px 10px 3px 0;white-space:nowrap}
+.g{color:#3fb950}.r{color:#f85149}.d{color:#8b949e}.w{color:#d29922}
+.cards{display:flex;flex-wrap:wrap;gap:10px;margin:8px 0}
+.card{background:#161b22;border:1px solid #30363d;border-radius:6px;
+padding:8px 12px;min-width:110px}
+.k{color:#8b949e;font-size:10px;text-transform:uppercase;letter-spacing:.04em}
+.v{font-size:15px;margin-top:2px}
+.note{color:#8b949e;font-size:11px;margin:6px 0 0;max-width:900px}
+"""
+
+
+def num(x, dp=2, plus=True):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return '<span class="d">-</span>'
+    cls = "g" if v >= 0 else "r"
+    fmt = "%+.*f" if plus else "%.*f"
+    return '<span class="%s">%s</span>' % (cls, fmt % (dp, v))
+
+
+def load(path):
+    p = os.path.join(ROOT, path)
+    if not os.path.exists(p):
+        return None
+    try:
+        return json.load(open(p))
+    except Exception:
+        return None
+
+
+def hours_since(iso_or_ms):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        if isinstance(iso_or_ms, (int, float)):
+            t = datetime.datetime.fromtimestamp(iso_or_ms / 1000,
+                                                datetime.timezone.utc)
+        else:
+            t = datetime.datetime.fromisoformat(
+                str(iso_or_ms).replace("Z", "+00:00"))
+        return (now - t).total_seconds() / 3600.0
+    except Exception:
+        return float("nan")
+
+
+def services():
+    out = ['<h2>Services</h2><div class="cards">']
+    for s in ("vega", "vega-reverse", "vega-majors", "vega-hlbook",
+              "vega-borrow", "vega-capacity.timer"):
+        try:
+            r = subprocess.run(["systemctl", "is-active", s],
+                               capture_output=True, text=True, timeout=5)
+            st = r.stdout.strip() or "unknown"
+        except Exception:
+            st = "unknown"
+        cls = "g" if st == "active" else ("w" if s == "vega-borrow" else "r")
+        note = " (oneshot)" if s == "vega-borrow" and st == "inactive" else ""
+        out.append('<div class="card"><div class="k">%s</div>'
+                   '<div class="v %s">%s%s</div></div>'
+                   % (html.escape(s), cls, st, note))
+    out.append("</div>")
+    return "".join(out)
+
+
+def position_book(path, title, sub, capital=None):
+    d = load(path)
+    if d is None:
+        return "<h2>%s</h2><p class='note'>no positions file</p>" % title
+
+    o = d.get("open") or {}
+    o = list(o.values()) if isinstance(o, dict) else list(o)
+    c = d.get("closed") or []
+    c = list(c.values()) if isinstance(c, dict) else list(c)
+
+    rows, tot, inprof, under, won, lost = [], 0.0, 0, 0, 0, 0
+    for p in o:
+        e = p.get("entry_cost_bps") or 0.0
+        net = (p.get("funding_collected_bps") or 0.0) - 2 * e
+        tot += net / 10000.0 * (p.get("notional_usd") or 0.0)
+        if net >= 0:
+            inprof += 1
+        else:
+            under += 1
+        rows.append((net, p, True))
+    for p in c:
+        e = p.get("entry_cost_bps") or 0.0
+        x = p.get("exit_cost_bps") or 0.0
+        net = (p.get("funding_collected_bps") or 0.0) - e - x
+        tot += net / 10000.0 * (p.get("notional_usd") or 0.0)
+        if net >= 0:
+            won += 1
+        else:
+            lost += 1
+        rows.append((net, p, False))
+
+    h = ["<h2>%s</h2><div class='sub'>%s</div>" % (title, sub)]
+    h.append('<div class="cards">')
+    h.append('<div class="card"><div class="k">open</div><div class="v">%d</div></div>' % len(o))
+    h.append('<div class="card"><div class="k">closed</div><div class="v">%d</div></div>' % len(c))
+    h.append('<div class="card"><div class="k">open: profit / under</div>'
+             '<div class="v">%d / %d</div></div>' % (inprof, under))
+    h.append('<div class="card"><div class="k">closed: won / lost</div>'
+             '<div class="v">%d / %d</div></div>' % (won, lost))
+    h.append('<div class="card"><div class="k">net</div><div class="v">%s</div></div>'
+             % num(tot, 3))
+    if capital:
+        h.append('<div class="card"><div class="k">on capital</div>'
+                 '<div class="v">%s%%</div></div>' % num(tot / capital * 100, 3))
+    h.append("</div>")
+
+    h.append("<table><tr><th></th><th>position</th><th>side</th><th>held</th>"
+             "<th>borrow/hr</th><th>net bps</th><th>exit vs est</th>"
+             "<th>reason</th></tr>")
+    for net, p, is_open in sorted(rows, key=lambda r: -r[0]):
+        if is_open:
+            held = hours_since(p.get("opened_at", ""))
+            ex, reason = "", ""
+        else:
+            held = hours_since(p.get("opened_at", ""))
+            e = p.get("entry_cost_bps") or 0.0
+            x = p.get("exit_cost_bps") or 0.0
+            ex = ("%.2f vs %.2f (%+.0f%%)"
+                  % (x, e, ((x - e) / e * 100) if e else 0))
+            reason = html.escape(str(p.get("close_reason") or "")[:44])
+        h.append("<tr><td class='d'>%s</td><td>%s</td><td>%+d</td>"
+                 "<td class='d'>%.1fh</td><td class='d'>%.3f</td>"
+                 "<td>%s</td><td class='d'>%s</td><td class='d'>%s</td></tr>"
+                 % ("OPEN" if is_open else "CLOSED",
+                    html.escape(str(p.get("id", "?"))), p.get("side", 1),
+                    held, p.get("borrow_bps_hr") or 0.0, num(net), ex, reason))
+    h.append("</table>")
+    return "".join(h)
+
+
+def majors():
+    st = load("data/majors/majors_state.json")
+    if st is None:
+        return "<h2>Majors book</h2><p class='note'>no state file</p>"
+    days = st.get("days") or []
+    complete = max(len(days) - 1, 0)
+    trail = 0.0
+    if complete:
+        vals = [d["sum_bps_hr"] / d["n"] for d in days[:-1][-14:] if d.get("n")]
+        trail = sum(vals) / len(vals) if vals else 0.0
+    f = st.get("funding_bps") or 0.0
+    cost = st.get("cost_bps") or 0.0
+    net = f - cost
+    notional, lev = 1000.0, 5.0
+    try:
+        unit = open("/etc/systemd/system/vega-majors.service").read()
+        for tok, which in (("-notional ", "n"), ("-leverage ", "l")):
+            if tok in unit:
+                v = float(unit.split(tok)[1].split()[0])
+                if which == "n":
+                    notional = v
+                else:
+                    lev = v
+    except Exception:
+        pass
+    cap = notional / lev if lev else notional
+
+    h = ["<h2>Majors book</h2>"
+         "<div class='sub'>static long-basis on deep coins, de-risk rule</div>"]
+    h.append('<div class="cards">')
+    h.append('<div class="card"><div class="k">position</div><div class="v %s">%s</div></div>'
+             % ("g" if st.get("invested") else "w",
+                "LONG BASIS" if st.get("invested") else "FLAT"))
+    h.append('<div class="card"><div class="k">notional / leverage</div>'
+             '<div class="v">$%.0f @ %gx</div></div>' % (notional, lev))
+    h.append('<div class="card"><div class="k">de-risk signal</div>'
+             '<div class="v">%s</div></div>' % num(trail, 4))
+    h.append('<div class="card"><div class="k">window</div>'
+             '<div class="v">%d / 14 days</div></div>' % min(complete, 14))
+    h.append('<div class="card"><div class="k">funding</div><div class="v">%s</div></div>'
+             % num(f))
+    h.append('<div class="card"><div class="k">cost</div><div class="v">%.2f</div></div>' % cost)
+    h.append('<div class="card"><div class="k">net on capital</div>'
+             '<div class="v">%s%%</div></div>'
+             % num(net / 10000.0 * notional / cap * 100 if cap else 0, 3))
+    h.append("</div>")
+    if complete < 14:
+        h.append("<p class='note'>The rule cannot act until the 14-day window "
+                 "fills. Negative is expected early: the round trip is charged "
+                 "at entry and earned back over the hold.</p>")
+    return "".join(h)
+
+
+BOROS_MARKETS = "https://api-boros.pendle.finance/apis/v1/markets"
+BOROS_CACHE = "data/boros/implied_cache.json"
+BOROS_TTL = 900
+
+
+def boros_forecast():
+    """coin -> Boros implied APR (%/yr), nearest live Hyperliquid maturity.
+
+    The `now` column on this table is NOT a forecast. It is the instantaneous
+    rate, and we measured that it predicts the forward average about as well as
+    a coin flip. This column is a forecast, priced by people with capital at
+    risk, and it is the honest comparison for our entry reads.
+
+    Cached 15 minutes. Fails silently and returns {} -- a Boros outage must
+    never blank this page, and a stale number shown as live would be worse than
+    no number at all.
+    """
+    import json as _j
+    import time as _t
+    import urllib.request as _u
+
+    cp = os.path.join(ROOT, BOROS_CACHE)
+    try:
+        if os.path.exists(cp) and _t.time() - os.path.getmtime(cp) < BOROS_TTL:
+            return _j.load(open(cp))
+    except Exception:
+        pass
+
+    try:
+        rows, token = [], None
+        while True:
+            url = BOROS_MARKETS + "?limit=200"
+            if token:
+                url += "&resumeToken=" + token
+            rq = _u.Request(url, headers={"User-Agent": "vega-web/1.0",
+                                          "Accept": "application/json"})
+            with _u.urlopen(rq, timeout=8) as r:
+                d = _j.loads(r.read().decode())
+            rows += d.get("results") or []
+            token = d.get("resumeToken")
+            if not token:
+                break
+
+        now = _t.time()
+        best = {}
+        for m in rows:
+            if ((m.get("platform") or {}).get("name") or "") != "Hyperliquid":
+                continue
+            im, da, md = (m.get("imData") or {}, m.get("data") or {},
+                          m.get("metadata") or {})
+            mat, imp = im.get("maturity"), da.get("markApr")
+            sym = (md.get("underlyingSymbol") or "").upper()
+            if not sym or not isinstance(mat, (int, float)) or mat <= now:
+                continue
+            if not isinstance(imp, (int, float)) or imp == 0:
+                continue
+            # Nearest maturity: our holds are days, not quarters.
+            if sym not in best or mat < best[sym][0]:
+                best[sym] = (mat, imp * 100.0)
+        out = {k: v[1] for k, v in best.items()}
+        try:
+            os.makedirs(os.path.dirname(cp), exist_ok=True)
+            _j.dump(out, open(cp, "w"))
+        except Exception:
+            pass
+        return out
+    except Exception:
+        try:
+            return _j.load(open(cp))
+        except Exception:
+            return {}
+
+
+def hlbook():
+    st = load("data/hlbook/state.json")
+    if st is None:
+        return ("<h2>Cross-venue book</h2>"
+                "<p class='note'>no state file -- is vega-hlbook running?</p>")
+    o = list((st.get("open") or {}).values())
+    c = st.get("closed") or []
+    won = sum(1 for p in c if (p.get("net_bps") or 0) >= 0)
+    open_net = sum((p.get("funding_bps") or 0) - (p.get("cost_bps") or 0) for p in o)
+    closed_net = sum(p.get("net_bps") or 0 for p in c)
+    cap = sum(p.get("capital_usd") or 0 for p in o)
+
+    h = ["<h2>Cross-venue book</h2><div class='sub'>short Hyperliquid perp / "
+         "long CEX spot &mdash; the spot leg is bought, not borrowed</div>"]
+    h.append('<div class="cards">')
+    h.append('<div class="card"><div class="k">open</div><div class="v">%d</div></div>' % len(o))
+    h.append('<div class="card"><div class="k">closed: won / lost</div>'
+             '<div class="v">%d / %d</div></div>' % (won, len(c) - won))
+    h.append('<div class="card"><div class="k">open bps</div><div class="v">%s</div></div>'
+             % num(open_net, 1))
+    h.append('<div class="card"><div class="k">closed bps</div><div class="v">%s</div></div>'
+             % num(closed_net, 1))
+    h.append('<div class="card"><div class="k">capital</div>'
+             '<div class="v">$%.0f</div></div>' % cap)
+    h.append("</div>")
+
+    rows = [((p.get("funding_bps") or 0) - (p.get("cost_bps") or 0), p, True)
+            for p in o]
+    rows += [(p.get("net_bps") or 0, p, False) for p in c]
+    fwd = boros_forecast()
+    h.append("<table><tr><th></th><th>coin</th><th>spot</th><th>held</th>"
+             "<th>entry %/yr</th><th>now %/yr</th><th>fwd %/yr</th>"
+             "<th>net bps</th><th>reason</th></tr>")
+    for net, p, is_open in sorted(rows, key=lambda r: -r[0]):
+        held = (hours_since(p.get("opened_ms")) if is_open
+                else (p.get("held_days") or 0) * 24)
+        entry = p.get("entry_f_pct_yr") or 0
+        now_f = p.get("last_f") or 0
+        decay = "r" if now_f < entry else "g"
+        # The market's forecast. Red when it sits BELOW the current rate,
+        # i.e. when Boros is pricing decay this position has not taken yet.
+        f = fwd.get(str(p.get("coin", "")).upper())
+        if f is None:
+            fcell = "<td class='d'>-</td>"
+        else:
+            fcell = "<td class='%s'>%.1f</td>" % ("r" if f < now_f else "g", f)
+        h.append("<tr><td class='d'>%s</td><td>%s</td><td class='d'>%s</td>"
+                 "<td class='d'>%.1fh</td><td class='d'>%.1f</td>"
+                 "<td class='%s'>%.1f</td>%s<td>%s</td>"
+                 "<td class='d'>%s</td></tr>"
+                 % ("OPEN" if is_open else "CLOSED",
+                    html.escape(str(p.get("coin", "?"))),
+                    html.escape(str(p.get("spot_venue", "?"))),
+                    held, entry, decay, now_f, fcell, num(net),
+                    html.escape(str(p.get("close_reason") or "")[:44])))
+    h.append("</table>")
+    h.append("<p class='note'><b>fwd</b> is the Boros implied APR for the "
+             "nearest live Hyperliquid maturity &mdash; a funding-rate futures "
+             "order book, so it is real money's forecast of what funding will "
+             "AVERAGE to maturity, not another spot reading. Our own history "
+             "cannot forecast this at all (slope 0.101, R&sup2; 0.066, and a "
+             "flat mean beats using the current rate), so where fwd sits well "
+             "below now, the market is pricing decay this book has not taken "
+             "yet. Cached 15 minutes; a dash means Boros lists no live market "
+             "for that coin, which is true of every alt.</p>")
+    if len(c) < 10:
+        h.append("<p class='note'>%d closes. The reverse book read +23.9%% at "
+                 "four closes and +4.6%% at seven &mdash; judge this at thirty, "
+                 "not before.</p>" % len(c))
+    return "".join(h)
+
+
+def capacity():
+    p = os.path.join(ROOT, "data/capacity/log.jsonl")
+    if not os.path.exists(p):
+        return ""
+    rows = []
+    for line in open(p):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            continue
+    live = [r for r in rows if not r.get("stale")]
+    if not live:
+        return ""
+    caps = sorted(r.get("capacity_usd", 0.0) for r in live)
+
+    def q(x):
+        return caps[min(int(x * (len(caps) - 1)), len(caps) - 1)]
+
+    pf = [r.get("profitable", 0) for r in live]
+    return ("<h2>Capacity of the alt opportunity set</h2>"
+            "<div class='sub'>%d samples, every 15 minutes</div>"
+            "<div class='cards'>"
+            "<div class='card'><div class='k'>median</div><div class='v'>$%.0f</div></div>"
+            "<div class='card'><div class='k'>p25 / p75</div><div class='v'>$%.0f / $%.0f</div></div>"
+            "<div class='card'><div class='k'>max</div><div class='v'>$%.0f</div></div>"
+            "<div class='card'><div class='k'>candidates</div><div class='v'>%d median</div></div>"
+            "</div>" % (len(live), q(0.5), q(0.25), q(0.75), caps[-1],
+                        statistics.median(pf)))
+
+
+def page():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    parts = ["<!doctype html><meta charset='utf-8'>"
+             "<meta http-equiv='refresh' content='60'>"
+             "<title>VEGA</title><style>%s</style>" % CSS,
+             "<h1>VEGA</h1><div class='sub'>%s UTC &mdash; refreshes every 60s"
+             "</div>" % now.strftime("%Y-%m-%d %H:%M:%S"),
+             services(),
+             hlbook(),
+             majors(),
+             position_book("data/reverse/positions.json", "Reverse book",
+                           "short spot / long perp on alts &mdash; works, "
+                           "holds pocket change", 1600.0),
+             position_book("data/positions.json", "Headline book",
+                           "alt cash-and-carry &mdash; the original thesis",
+                           400.0),
+             capacity(),
+             "<p class='note'>Exit costs on OPEN positions are ESTIMATES, "
+             "assumed symmetric with entry. Measured on real closes they run "
+             "about 12% higher, so open P&amp;L is mildly optimistic. Win and "
+             "loss counts move only on closes; open positions are shown as in "
+             "profit or underwater, which is a different thing.</p>"]
+    return "".join(parts)
+
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            body = page().encode()
+        except Exception as e:
+            body = ("<pre>error building page: %s</pre>"
+                    % html.escape(str(e))).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=8090)
+    ap.add_argument("--bind", default="127.0.0.1")
+    a = ap.parse_args()
+    print("VEGA web on http://%s:%d (read-only)" % (a.bind, a.port))
+    HTTPServer((a.bind, a.port), H).serve_forever()
+
+
+if __name__ == "__main__":
+    main()

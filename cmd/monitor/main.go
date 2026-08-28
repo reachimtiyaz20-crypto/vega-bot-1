@@ -1,0 +1,257 @@
+// Command monitor is VEGA's long-running measurement process.
+//
+// It polls venues, costs every observation with verified fees and measured
+// books, and journals to daily-rotated JSONL. It places no orders, holds no
+// credentials, and has no code path that could.
+//
+// Run under systemd. Logs go to stdout, which journald captures.
+//
+//	monitor -data ~/vega-bot/data
+//	monitor -data ~/vega-bot/data -poll 5m -sweep 30m -notional 10000
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"github.com/imtiyaz/vega-bot/pkg/capital"
+	"github.com/imtiyaz/vega-bot/pkg/dashboard"
+	"github.com/imtiyaz/vega-bot/pkg/exchange"
+	"github.com/imtiyaz/vega-bot/pkg/funding"
+	"github.com/imtiyaz/vega-bot/pkg/journal"
+)
+
+func main() {
+	dataDir := flag.String("data", "", "data directory (required)")
+	poll := flag.Duration("poll", 5*time.Minute, "how often to query venues")
+	sweep := flag.Duration("sweep", 30*time.Minute, "how often to journal every hedgeable symbol")
+	notional := flag.Float64("notional", 10000, "notional USD per leg")
+	holdShort := flag.Float64("hold-short", 7, "short assessment horizon in days")
+	holdLong := flag.Float64("hold-long", 30, "long assessment horizon in days")
+	minVol := flag.Float64("min-vol", 50_000_000, "minimum 24h quote volume, both legs")
+	minDepth := flag.Float64("min-depth", 0.25, "required top-of-book as a fraction of notional")
+	maxSlip := flag.Float64("max-slip", 8, "reject if MEASURED round-trip slippage exceeds this many bps")
+	fallbackSlip := flag.Float64("fallback-slip", 2.0, "slippage bps/leg when the book cannot be read")
+	httpAddr := flag.String("http", "127.0.0.1:8081", "dashboard listen address; empty disables it")
+	crossData := flag.String("cross-data", "", "directory holding the cross-venue book; empty uses -data")
+	capitalConfig := flag.String("capital-config", "config/capital.json",
+		"capital budget config; if absent the book runs with NO ceiling")
+	capitalBook := flag.String("capital-book", "headline",
+		"which book in that config this process draws from; empty disables the ceiling")
+	reverse := flag.Bool("reverse", false,
+		"also open SHORT SPOT positions when funding is negative; needs borrow data")
+	borrowMax := flag.Float64("borrow-max-annual", 200.0,
+		"refuse to short a coin lending above this annual percent")
+	borrowData := flag.String("borrow-data", "data",
+		"directory holding borrow/rates.jsonl. SHARED, not per-book: what a "+
+			"venue charges to lend a coin does not depend on which book is asking")
+	dashReverse := flag.String("reverse-data-view", "",
+		"reverse book directory to DISPLAY on the dashboard. Read-only, and "+
+			"separate from -data: this is the book this box SHOWS, not the one it trades. "+
+			"Empty hides the section entirely, which is deliberately different from "+
+			"showing a reverse book that holds nothing")
+	maxConc := flag.Int("max-concurrent", 5,
+		"how many positions the book may hold at once. The capital ledger is "+
+			"still the authority: this cannot spend money the book does not have")
+	minNet := flag.Float64("min-net-bps", 0,
+		"refuse an entry unless its expected net over the planned hold "+
+			"exceeds borrow by at least this many bps. 0 keeps the old "+
+			"behaviour of accepting anything positive")
+	flag.Parse()
+
+	logger := log.New(os.Stdout, "", log.LstdFlags|log.LUTC)
+
+	if *dataDir == "" {
+		logger.Fatal("FATAL -data is required; refusing to guess where three months of evidence should live")
+	}
+	abs, err := filepath.Abs(*dataDir)
+	if err != nil {
+		logger.Fatalf("FATAL resolving -data: %v", err)
+	}
+	journalDir := filepath.Join(abs, "journal")
+
+	j, err := journal.Open(journalDir)
+	if err != nil {
+		logger.Fatalf("FATAL opening journal: %v", err)
+	}
+	defer j.Close()
+
+	reg := exchange.NewRegistry(exchange.NewBinance(*fallbackSlip), exchange.NewBybit(*fallbackSlip))
+
+	cons := exchange.Constraints{
+		NotionalUSD:              *notional,
+		HoldDays:                 *holdLong,
+		MinQuoteVolume24hUSD:     *minVol,
+		MinTopOfBookFraction:     *minDepth,
+		RequireMeasuredLiquidity: true,
+		MaxRoundTripSlippageBps:  *maxSlip,
+	}
+
+	paperCfg := funding.DefaultPaperConfig()
+
+	// The paper book must enter on the SAME filters the scanner reports
+	// against. Until these four lines existed it did not, and the two
+	// disagreed silently.
+	paperCfg.NotionalUSD = *notional
+	paperCfg.MinQuoteVolume24hUSD = *minVol
+	paperCfg.MinTopOfBookFraction = *minDepth
+	paperCfg.MaxRoundTripSlippageBps = *maxSlip
+	paperCfg.PlannedHoldDays = *holdLong
+	paperCfg.MinNetBps = *minNet
+	paperCfg.MaxConcurrent = *maxConc
+	book, err := funding.NewBook(abs, paperCfg)
+	if err != nil {
+		logger.Fatalf("FATAL loading paper book: %v", err)
+	}
+
+	// Attach the capital ledger. See cmd/cross for why an absent config is
+	// permitted but announced.
+	if *capitalBook == "" {
+		logger.Printf("capital: DISABLED by -capital-book=\"\" -- book is UNBOUNDED")
+	} else if lg, lerr := capital.BookFor(*capitalConfig, abs, *capitalBook); lerr != nil {
+		logger.Fatalf("FATAL loading capital book %q: %v", *capitalBook, lerr)
+	} else if lg == nil {
+		logger.Printf("capital: %s absent -- book is UNBOUNDED", *capitalConfig)
+	} else {
+		book.Capital = lg
+		s := lg.Snapshot(time.Now().UTC())
+		logger.Printf("capital book %q (%s): principal $%.2f, reserve $%.2f, free $%.2f, %d holds carried over",
+			s.Name, s.Service, s.Principal, s.Reserve, s.Free, s.Positions)
+	}
+
+	// REVERSE CARRY.
+	//
+	// Off unless asked for. When on, the book may open short-spot positions on
+	// coins the market is paying you to be short -- measured 2026-08-24 as the
+	// only structure that made money over 19 days.
+	//
+	// Borrow is the dominant cost and the binding constraint. A coin absent
+	// from the rate map cannot be shorted at all, so an empty map means no
+	// reverse positions rather than free ones.
+	if *reverse {
+		rates, rerr := funding.LoadBorrowRates(*borrowData)
+		if rerr != nil {
+			logger.Fatalf("FATAL loading borrow rates: %v", rerr)
+		}
+		// Drop lenders whose price would eat the trade. At the 2.8h median hold
+		// a 200%/yr rate costs 6.4 bps against a ~10 bps median net; past that
+		// the borrow is the trade.
+		cut := 0
+		for c, bpsHr := range rates {
+			if bpsHr*8760.0/100.0 > *borrowMax {
+				delete(rates, c)
+				cut++
+			}
+		}
+		book.Reverse = true
+		book.Borrow = rates
+		logger.Printf("REVERSE CARRY ENABLED: %d borrowable coins (%d dropped above %.0f%%/yr)",
+			len(rates), cut, *borrowMax)
+		if len(rates) == 0 {
+			logger.Printf("  no borrowable coins: reverse positions cannot open. " +
+				"Is vega-borrow running with a wide -currencies list?")
+		}
+	}
+
+	m := funding.New(reg, j, cons, logger)
+	m.Book = book
+	m.Policy.PollInterval = *poll
+	m.Policy.FullSweepInterval = *sweep
+	m.HoldDaysShort = *holdShort
+	m.HoldDaysLong = *holdLong
+
+	// State what is being assumed, every start, in the log. Three months from
+	// now the only way to know what fee model produced a record is to have
+	// written it down at the time.
+	logger.Printf("VEGA monitor -- PAPER MEASUREMENT ONLY, no order placement exists in this binary")
+	logger.Printf("journal: %s", journalDir)
+	logger.Printf("policy:  %s", m.Policy)
+	for _, s := range reg.Sources() {
+		v := s.Venue()
+		state := "VERIFIED"
+		if err := v.Validate(); err != nil {
+			state = "UNVERIFIED (" + err.Error() + ")"
+		}
+		logger.Printf("venue %s: round trip %.1f bps before slippage, fees %s, source %s checked %s",
+			v.Name, v.Fees.RoundTripBps(), state, v.Source.URL, v.Source.VerifiedOn)
+	}
+
+	est := funding.EstimateDailyBytes(371, m.Policy, 700)
+	logger.Printf("projected journal growth: %s/day, %s over 90 days before gzip",
+		humanBytes(est), humanBytes(est*90))
+
+	if free, err := freeDiskBytes(abs); err == nil {
+		logger.Printf("free disk at %s: %s", abs, humanBytes(free))
+		if est*90 > free/2 {
+			logger.Printf("WARNING projected 90-day journal exceeds half of free disk; lengthen -sweep")
+		}
+	}
+
+	// Dashboard. Localhost by default: this box is under continuous SSH
+	// brute-force and the page has no authentication. Reach it with
+	//   ssh -L 8081:localhost:8081 root@<host>
+	if *httpAddr != "" {
+		crossDir := abs
+		if *crossData != "" {
+			crossDir = *crossData
+		}
+		ds := &dashboard.Server{JournalDir: journalDir, DataDir: abs, CrossDataDir: crossDir, ReverseDataDir: *dashReverse, Registry: reg, StartedAt: time.Now()}
+		srv := &http.Server{
+			Addr:              *httpAddr,
+			Handler:           ds.Handler(),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		go func() {
+			logger.Printf("dashboard on http://%s (read-only, reads the journal not the exchange)", *httpAddr)
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Printf("ERROR dashboard: %v", err)
+			}
+		}()
+	}
+
+	st := book.Stats(time.Now().UTC())
+	logger.Printf("paper book: %d open, %d closed, net %+.2f bps ($%+.2f) across the ledger so far",
+		st.OpenCount, st.ClosedCount, st.TotalNetBps, st.TotalNetUSD)
+	logger.Printf("paper policy: max %d concurrent, %.0f-day hold, exit after %d negative settlements, %s re-entry cooldown",
+		paperCfg.MaxConcurrent, paperCfg.PlannedHoldDays,
+		paperCfg.NegativeIntervalsBeforeExit, paperCfg.ReenterCooldown)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := m.Run(ctx); err != nil {
+		logger.Printf("monitor exited: %v", err)
+	}
+
+	records, bytes, day := j.Stats()
+	logger.Printf("shutdown clean: %d records, %s written, current day %s", records, humanBytes(bytes), day)
+}
+
+func freeDiskBytes(path string) (int64, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return 0, err
+	}
+	return int64(st.Bavail) * int64(st.Bsize), nil
+}
+
+func humanBytes(b int64) string {
+	switch {
+	case b >= 1<<30:
+		return fmt.Sprintf("%.2f GB", float64(b)/(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(b)/(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.1f KB", float64(b)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
+}

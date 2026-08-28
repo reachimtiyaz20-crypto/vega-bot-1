@@ -1,0 +1,23 @@
+{
+  "updated": "2026-08-20",
+  "warning": "Verify every figure against your OWN executed fills. Published schedules are a starting point, not evidence: OKX was recorded here at 25 bps until 2026-08-19, taken from the SPOT table, which overstated every OKX round trip by 40 bps and produced a false 'OKX is structurally expensive' conclusion repeated three times in analysis.",
+  "taker_bps": {
+    "hyperliquid": 4.5,
+    "binance": 5.0,
+    "bybit": 5.5,
+    "okx": 5.0,
+    "bitget": 6.0,
+    "lighter": 0.0
+  },
+  "provenance": {
+    "hyperliquid": "docs, 2026-08-11",
+    "binance": "live fee page, 2026-08-05",
+    "bybit": "live fee panel, 2026-08-05",
+    "okx": "published Lv1 futures schedule, corrected 2026-08-19",
+    "bitget": "published futures schedule, 2026-08-18",
+    "lighter": "API reports zero"
+  },
+  "per_symbol_venues": {
+    "mexc": "priced per symbol via contract/detail.takerFeeRate: 0 bps on 540 contracts, 2 on 472, 4 on 66, 10 on 25. No venue-wide figure is correct for it."
+  }
+}

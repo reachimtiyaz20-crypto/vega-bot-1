@@ -1,0 +1,913 @@
+package crossvenue
+
+import (
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// fixedNow is the clock every test in this package runs on.
+//
+// goodCandidate carries next-funding timestamps, and the entry gate now
+// simulates the settlement calendar forward from them. With time.Now() those
+// timestamps moved between calls, so two identical candidates looked like a
+// venue clock advancing and the detector booked a settlement that never
+// happened. Deterministic tests need a deterministic calendar.
+var fixedNow = time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+
+func near(a, b, tol float64) bool { return math.Abs(a-b) <= tol }
+
+// --- THE TWO-CLOCK TEST ------------------------------------------------------
+
+// TestTwoClocksAccrueToTheSameSpread.
+//
+// This is the test the whole package exists for.
+//
+// Long Hyperliquid at -2.0 bps/hr (negative: longs are PAID).
+// Short Binance   at +1.0 bps/hr (positive: shorts are PAID).
+// Spread = 1.0 - (-2.0) = 3.0 bps/hr.
+//
+// Over 24 hours the legs settle on completely different clocks:
+//
+//	Hyperliquid: 24 settlements x (-(-2.0) x 1h) = +48.00 bps
+//	Binance:      3 settlements x (+1.0   x 8h) = +24.00 bps
+//	                                              --------
+//	                                               +72.00 bps
+//
+// And 3.0 bps/hr x 24 h = 72.00 bps. The two must agree exactly. If they do
+// not, one leg is being accrued on the other's clock, and the error is 8x in
+// whichever direction happens to flatter the result.
+func TestTwoClocksAccrueToTheSameSpread(t *testing.T) {
+	base := time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)
+	p := &Position{
+		Coin:               "KAITO",
+		LongVenue:          "hyperliquid",
+		ShortVenue:         "binance",
+		OpenedAt:           base,
+		NotionalUSD:        400,
+		CapitalUSD:         800,
+		LongIntervalHours:  1,
+		ShortIntervalHours: 8,
+	}
+	p.ObserveRates(-2.0, 1.0, base)
+
+	for h := 1; h <= 24; h++ {
+		at := base.Add(time.Duration(h) * time.Hour)
+		p.SettleLong(-2.0, at) // hourly
+		if h%8 == 0 {
+			p.SettleShort(1.0, at) // 8-hourly
+		}
+	}
+
+	if p.LongSettlements != 24 {
+		t.Fatalf("hyperliquid settled %d times in a day, want 24", p.LongSettlements)
+	}
+	if p.ShortSettlements != 3 {
+		t.Fatalf("binance settled %d times in a day, want 3", p.ShortSettlements)
+	}
+	if !near(p.LongLegBps, 48, 1e-9) {
+		t.Fatalf("long leg %.4f bps, want 48", p.LongLegBps)
+	}
+	if !near(p.ShortLegBps, 24, 1e-9) {
+		t.Fatalf("short leg %.4f bps, want 24", p.ShortLegBps)
+	}
+
+	total := p.FundingCollectedBps()
+	fromSpread := p.CurrentSpreadBpsHr() * 24
+
+	if !near(total, 72, 1e-9) {
+		t.Fatalf("accrued %.4f bps over a day, want 72", total)
+	}
+	if !near(total, fromSpread, 1e-9) {
+		t.Fatalf("settlement accrual %.4f disagrees with spread x hours %.4f -- "+
+			"one leg is on the wrong clock", total, fromSpread)
+	}
+}
+
+// TestLongLegPaysWhenItsRateIsPositive.
+//
+// The long venue is the LOWER-paying one, but lower is not always negative. If
+// both venues are positive, the long leg pays out and only the difference is
+// earned. Getting this sign backwards doubles the apparent edge.
+func TestLongLegPaysWhenItsRateIsPositive(t *testing.T) {
+	base := fixedNow
+	p := &Position{
+		LongIntervalHours:  1,
+		ShortIntervalHours: 1,
+		OpenedAt:           base,
+	}
+	p.ObserveRates(0.5, 2.0, base)
+	p.SettleLong(0.5, base)
+	p.SettleShort(2.0, base)
+
+	if p.LongLegBps >= 0 {
+		t.Fatalf("long leg earned %+.4f on a POSITIVE funding rate; longs pay shorts", p.LongLegBps)
+	}
+	if !near(p.LongLegBps, -0.5, 1e-9) {
+		t.Fatalf("long leg %.4f, want -0.5", p.LongLegBps)
+	}
+	if !near(p.FundingCollectedBps(), 1.5, 1e-9) {
+		t.Fatalf("net %.4f, want the 1.5 spread", p.FundingCollectedBps())
+	}
+}
+
+// TestHeldHoursIsWallClockNotSettlements.
+//
+// Carried from the KAITO bug of 2026-08-11: a pair seen at 19:51, 20:07 and
+// 21:07 touches three hour buckets but has lived 1.27 hours, against a 2.1 hour
+// break-even. Break-even is a DURATION.
+func TestHeldHoursIsWallClockNotSettlements(t *testing.T) {
+	base := time.Date(2026, 8, 11, 19, 51, 0, 0, time.UTC)
+	p := &Position{OpenedAt: base, LongIntervalHours: 1, ShortIntervalHours: 8}
+
+	for _, at := range []time.Time{
+		base.Add(16 * time.Minute), // 20:07
+		base.Add(76 * time.Minute), // 21:07
+	} {
+		p.SettleLong(-1, at)
+	}
+
+	now := base.Add(76 * time.Minute)
+	if h := p.HeldHours(now); !near(h, 76.0/60.0, 1e-9) {
+		t.Fatalf("held %.4f hours, want 1.2667 -- settlement count is not elapsed time", h)
+	}
+}
+
+// --- entry gate --------------------------------------------------------------
+
+func testBook(t *testing.T, tweak func(*Config)) *Book {
+	t.Helper()
+	cfg := DefaultConfig(400)
+	cfg.FeesVerified = true
+	if tweak != nil {
+		tweak(&cfg)
+	}
+	b, err := NewBook(t.TempDir(), cfg)
+	if err != nil {
+		t.Fatalf("NewBook: %v", err)
+	}
+	return b
+}
+
+// goodCandidate passes every gate: KAITO's shape on 2026-08-11.
+func goodCandidate() Candidate {
+	return Candidate{
+		Coin:               "KAITO",
+		LongVenue:          "hyperliquid",
+		ShortVenue:         "binance",
+		LongBpsHr:          -24.0,
+		ShortBpsHr:         1.3,
+		LongIntervalHours:  1,
+		ShortIntervalHours: 8,
+		// A real calendar: the hourly leg settles in 30 minutes, the
+		// 8-hourly leg in 2 hours. Without this the gate sees two timestamps
+		// in 1970 and judges a path that never existed.
+		LongNextFundingMs:  fixedNow.Add(30 * time.Minute).UnixMilli(),
+		ShortNextFundingMs: fixedNow.Add(2 * time.Hour).UnixMilli(),
+		LongMeasured:       true,
+		ShortMeasured:      true,
+		LongEntrySlipBps:   2.0,
+		ShortEntrySlipBps:  1.5,
+		LongExitSlipBps:    2.0,
+		ShortExitSlipBps:   1.5,
+		LongDepthUSD:       5000,
+		ShortDepthUSD:      5000,
+		VolUSD:             50_000_000,
+	}
+}
+
+func TestGoodCandidatePasses(t *testing.T) {
+	b := testBook(t, nil)
+	a := b.assess(goodCandidate(), fixedNow)
+	if !a.Viable {
+		t.Fatalf("refused a viable pair: %s / %s", a.Gate, a.Reason)
+	}
+	// entry = 4.5 + 5.0 + 2.0 + 1.5 = 13.0
+	if !near(a.EntryCostBps, 13.0, 1e-9) {
+		t.Fatalf("entry cost %.3f, want 13.0", a.EntryCostBps)
+	}
+	if !near(a.RoundTripBps, 26.0, 1e-9) {
+		t.Fatalf("round trip %.3f, want 26.0", a.RoundTripBps)
+	}
+	// Break-even is the SETTLEMENT CALENDAR, not roundTrip/spread.
+	//
+	//	t=0     open                    net -26.0
+	//	t=0.5h  hourly leg pays +24     net  -2.0
+	//	t=1.5h  hourly leg pays +24     net +22.0   <- whole here
+	//
+	// roundTrip/spread says 1.03h and is wrong: it assumes funding trickles in
+	// continuously when it arrives in lumps. The position is underwater for a
+	// full extra half hour that the continuous formula cannot see.
+	if a.BreakEvenHrs < 1.4 || a.BreakEvenHrs > 1.6 {
+		t.Fatalf("break-even %.3f h, want 1.5 (the second hourly settlement)", a.BreakEvenHrs)
+	}
+	if a.Plan.WorstNetBps < -27 || a.Plan.WorstNetBps > -25 {
+		t.Fatalf("worst %.2f bps, want about -26 (the round trip, paid at open)",
+			a.Plan.WorstNetBps)
+	}
+}
+
+// TestUnverifiedFeesRefuseEverything.
+//
+// The edge is a few bps per hour. A wrong fee does not shrink the profit, it
+// reverses the sign.
+func TestUnverifiedFeesRefuseEverything(t *testing.T) {
+	b := testBook(t, func(c *Config) { c.FeesVerified = false })
+	a := b.assess(goodCandidate(), fixedNow)
+	if a.Viable {
+		t.Fatal("opened a position on fees nobody has verified")
+	}
+	if a.Gate != GateFeesUnverified {
+		t.Fatalf("gate %q, want %q", a.Gate, GateFeesUnverified)
+	}
+}
+
+func TestUnmeasuredBookIsRefused(t *testing.T) {
+	b := testBook(t, nil)
+	for _, mut := range []func(*Candidate){
+		func(c *Candidate) { c.LongMeasured = false },
+		func(c *Candidate) { c.ShortMeasured = false },
+	} {
+		c := goodCandidate()
+		mut(&c)
+		if a := b.assess(c, fixedNow); a.Viable {
+			t.Fatal("sized a position against a book nobody read")
+		} else if a.Gate != GateBookUnmeasured {
+			t.Fatalf("gate %q, want %q", a.Gate, GateBookUnmeasured)
+		}
+	}
+}
+
+// TestExhaustedBookIsRefused. A partial second leg is a naked position.
+func TestExhaustedBookIsRefused(t *testing.T) {
+	b := testBook(t, nil)
+	c := goodCandidate()
+	c.ShortExhausted = true
+
+	a := b.assess(c, fixedNow)
+	if a.Viable {
+		t.Fatal("accepted a pair whose short book cannot fill the size")
+	}
+	if !strings.Contains(a.Reason, "naked") {
+		t.Fatalf("refusal does not name the danger: %s", a.Reason)
+	}
+}
+
+// TestUnknownIntervalIsRefusedNotGuessed.
+func TestUnknownIntervalIsRefusedNotGuessed(t *testing.T) {
+	b := testBook(t, nil)
+	c := goodCandidate()
+	c.ShortIntervalHours = 0
+
+	a := b.assess(c, fixedNow)
+	if a.Viable {
+		t.Fatal("accepted a venue whose settlement interval is unknown")
+	}
+	if a.Gate != GateUnknownInterval {
+		t.Fatalf("gate %q, want %q", a.Gate, GateUnknownInterval)
+	}
+}
+
+// TestCannotRepayIsRefused.
+//
+// The measured reality of 2026-08-11: 44 of 46 pairs needed 90-200 hours to
+// repay. Taking all of them for one day lost $720.
+func TestCannotRepayIsRefused(t *testing.T) {
+	b := testBook(t, nil)
+	// The spread must CLEAR the MinSpreadBpsHr floor, or this refuses for the
+	// wrong reason and the break-even gate is never exercised.
+	//
+	// spread 2.0 bps/hr, round trip 59 bps -> 29.5 hours, past the 24 cap.
+	c := goodCandidate()
+	c.LongBpsHr = -1.5
+	c.ShortBpsHr = 0.5
+	c.LongEntrySlipBps, c.ShortEntrySlipBps = 10, 10
+	c.LongExitSlipBps, c.ShortExitSlipBps = 10, 10
+
+	a := b.assess(c, fixedNow)
+	if a.Viable {
+		t.Fatalf("accepted a pair needing %.0f hours to repay", a.BreakEvenHrs)
+	}
+	if a.Gate != GateCannotRepay {
+		t.Fatalf("gate %q, want %q", a.Gate, GateCannotRepay)
+	}
+}
+
+// TestThinnerLegBindsSizing.
+func TestThinnerLegBindsSizing(t *testing.T) {
+	b := testBook(t, nil)
+	c := goodCandidate()
+	c.LongDepthUSD = 10000 // 0.5 -> 5000
+	c.ShortDepthUSD = 700  // 0.5 -> 350  <- binds
+
+	a := b.assess(c, fixedNow)
+	if !a.Viable {
+		t.Fatalf("refused: %s", a.Reason)
+	}
+	if !near(a.NotionalUSD, 350, 1e-9) {
+		t.Fatalf("sized $%.2f against a $700 short book, want 350", a.NotionalUSD)
+	}
+	if a.LimitedBy != "short book" {
+		t.Fatalf("limited by %q, want short book", a.LimitedBy)
+	}
+	if !a.Reduced {
+		t.Fatal("size was cut but Reduced is false")
+	}
+}
+
+// TestBelowExchangeMinimumIsRefused.
+func TestBelowExchangeMinimumIsRefused(t *testing.T) {
+	b := testBook(t, nil)
+	// The preference floor moved 200 -> 50, so this needs a genuinely
+	// unworkable size: 0.5 * 40 = $20, under both the floor and bybit's own
+	// minimum.
+	c := goodCandidate()
+	c.ShortDepthUSD = 40 // 0.5 -> $20
+
+	a := b.assess(c, fixedNow)
+	if a.Viable {
+		t.Fatalf("accepted $%.2f, below the exchange minimum", a.NotionalUSD)
+	}
+	if !strings.Contains(a.Reason, "naked") {
+		t.Fatalf("refusal does not explain why: %s", a.Reason)
+	}
+}
+
+func TestSameVenueIsNotACrossVenueTrade(t *testing.T) {
+	b := testBook(t, nil)
+	c := goodCandidate()
+	c.ShortVenue = c.LongVenue
+
+	if a := b.assess(c, fixedNow); a.Viable {
+		t.Fatal("accepted both legs on one venue")
+	}
+}
+
+// TestZeroConfigDoesNotDisableFilters.
+//
+// The worst bug of this project so far: a zero value reading as "filter off".
+// pkg/funding.Book had hardcoded constraints that silently ignored every flag
+// for a week.
+func TestZeroConfigDoesNotDisableFilters(t *testing.T) {
+	b, err := NewBook(t.TempDir(), Config{FeesVerified: true})
+	if err != nil {
+		t.Fatalf("NewBook: %v", err)
+	}
+	cfg := b.Config()
+
+	if cfg.NotionalUSD <= 0 || cfg.MaxConcurrent <= 0 || cfg.MinSpreadBpsHr <= 0 ||
+		cfg.MaxEntryCostBps <= 0 || cfg.MaxBreakEvenHours <= 0 || cfg.MinVolUSD <= 0 ||
+		cfg.MinHoldHours <= 0 || cfg.MaxHoldHours <= 0 || cfg.StopLossBps >= 0 ||
+		cfg.NegativeSettlementsBeforeExit <= 0 || cfg.MinNotionalUSD <= 0 ||
+		cfg.ReenterCooldown <= 0 || len(cfg.TakerBps) == 0 {
+		t.Fatalf("a zero config left a filter disabled: %+v", cfg)
+	}
+
+	// And it must actually bite.
+	c := goodCandidate()
+	c.LongBpsHr, c.ShortBpsHr = -0.01, 0.01
+	if a := b.assess(c, fixedNow); a.Viable {
+		t.Fatal("zero config accepted a pair that can never repay")
+	}
+}
+
+// --- exit rule ---------------------------------------------------------------
+
+// openPosition puts one position in the book by hand.
+func openPosition(b *Book, p *Position) { b.state.Open[p.Key()] = p }
+
+func heldPosition(openedAgo time.Duration, now time.Time) *Position {
+	p := &Position{
+		Coin:               "KAITO",
+		LongVenue:          "hyperliquid",
+		ShortVenue:         "binance",
+		OpenedAt:           now.Add(-openedAgo),
+		NotionalUSD:        400,
+		CapitalUSD:         800,
+		LongIntervalHours:  1,
+		ShortIntervalHours: 8,
+		EntryCostBps:       13,
+		EntryCostMeasured:  true,
+		LongNextFundingMs:  1_000_000,
+		ShortNextFundingMs: 2_000_000,
+	}
+	p.ObserveRates(-24.0, 1.3, now)
+	return p
+}
+
+// TestHoldsWhileUnderwater.
+//
+// THE rule. Closing an underwater position converts an unrealised loss into a
+// paid round trip. Six of those in four days cost the cash-and-carry book
+// 186 bps.
+func TestHoldsWhileUnderwater(t *testing.T) {
+	b := testBook(t, nil)
+	now := fixedNow
+
+	p := heldPosition(10*time.Hour, now)
+	p.LongLegBps = 5 // barely any funding: net = 5 - 26 = -21
+	p.NegativeSettlements = 99
+	p.ObserveRates(-0.1, -0.5, now) // spread now inverted
+
+	if p.NetBps() >= 0 {
+		t.Fatalf("fixture is not underwater: %.2f", p.NetBps())
+	}
+
+	reason, _, _ := b.exitReason(p, Candidate{}, now)
+	if reason != "" {
+		t.Fatalf("closed an underwater position and paid the exit to lock it in: %s", reason)
+	}
+}
+
+// TestStopLossFiresInsideMinimumHold. A floor that switches off is not a floor.
+func TestStopLossFiresInsideMinimumHold(t *testing.T) {
+	b := testBook(t, nil)
+	now := fixedNow
+
+	p := heldPosition(30*time.Minute, now) // well inside MinHoldHours = 4
+	p.LongLegBps = -50                     // net = -50 - 26 = -76, past -60
+
+	reason, _, _ := b.exitReason(p, Candidate{}, now)
+	if reason == "" {
+		t.Fatalf("stop loss silent at net %.2f bps against a %.2f floor",
+			p.NetBps(), b.Config().StopLossBps)
+	}
+	if !strings.Contains(reason, "stop loss") {
+		t.Fatalf("closed for the wrong reason: %s", reason)
+	}
+}
+
+// TestMaxHoldOverridesEverything.
+func TestMaxHoldOverridesEverything(t *testing.T) {
+	b := testBook(t, nil)
+	now := fixedNow
+
+	p := heldPosition(800*time.Hour, now) // past MaxHoldHours = 720
+	p.LongLegBps = 500                    // handsomely profitable
+
+	reason, _, _ := b.exitReason(p, Candidate{}, now)
+	if !strings.Contains(reason, "max hold") {
+		t.Fatalf("held past the cap: %q", reason)
+	}
+}
+
+// TestExitsOnceProfitableAndSpreadIsGone.
+func TestExitsOnceProfitableAndSpreadIsGone(t *testing.T) {
+	b := testBook(t, nil)
+	now := fixedNow
+
+	p := heldPosition(10*time.Hour, now)
+	p.LongLegBps = 100 // net = 100 - 26 = +74
+	p.ObserveRates(0.5, 0.1, now)
+	p.NegativeSettlements = 3
+
+	reason, _, _ := b.exitReason(p, Candidate{}, now)
+	if reason == "" {
+		t.Fatal("held a profitable position through a collapsed spread")
+	}
+	if !strings.Contains(reason, "spread gone") {
+		t.Fatalf("closed for the wrong reason: %s", reason)
+	}
+}
+
+// TestClosingDoorExitsEvenWhileProfitable.
+//
+// ExitWatch is wired here from the start, unlike in pkg/funding. If leaving
+// costs more each hour than staying earns, leave.
+func TestClosingDoorExitsEvenWhileProfitable(t *testing.T) {
+	b := testBook(t, nil)
+	now := fixedNow
+	base := now.Add(-10 * time.Hour)
+
+	p := heldPosition(10*time.Hour, now)
+	p.LongLegBps = 60 // profitable
+
+	// The drift must beat funding WITHOUT dragging net past the stop loss --
+	// otherwise this test passes for the wrong reason.
+	//
+	// The first draft climbed 20 bps/hour to an exit cost of 113. NetBps reads
+	// the LIVE exit cost now that ExitWatch is wired, so net went to -66 and
+	// the stop loss fired first. That was the feature working: before wiring,
+	// NetBps used the stale 13 bps entry estimate and would have reported +34
+	// on a position that cost 113 bps to leave.
+	//
+	// +2 bps/hour = 48 bps/day of drift against 24 bps/day earned.
+	// Exit cost ends at 23, so net = 60 - 13 - 23 = +24. Still profitable.
+	cost := 13.0
+	p.ObserveExitCost(cost, base)
+	for i := 1; i <= 5; i++ {
+		cost += 2
+		p.ObserveExitCost(cost, base.Add(time.Duration(i)*time.Hour))
+	}
+	// Earning modestly: spread 1 bps/hr = 24 bps/day.
+	p.ObserveRates(0, 1.0, now)
+
+	if p.NetBps() < 0 {
+		t.Fatalf("fixture is not profitable (net %.2f); this would exercise the "+
+			"stop loss, not the door rule", p.NetBps())
+	}
+
+	reason, _, _ := b.exitReason(p, Candidate{}, now)
+	if reason == "" {
+		t.Fatalf("held through a door closing at %.1f bps/day against %.1f earned",
+			p.DriftBpsPerDay, p.FundingPerDayBps())
+	}
+	if !strings.Contains(reason, "exit liquidity closing") {
+		t.Fatalf("closed for the wrong reason: %s", reason)
+	}
+}
+
+// --- the update loop ---------------------------------------------------------
+
+func TestUpdateOpensAndPersists(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig(400)
+	cfg.FeesVerified = true
+
+	b, err := NewBook(dir, cfg)
+	if err != nil {
+		t.Fatalf("NewBook: %v", err)
+	}
+	now := fixedNow
+
+	res, err := b.Update(now, []Candidate{goodCandidate()})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if len(res.Opened) != 1 {
+		t.Fatalf("opened %d, want 1 (refusals %v)", len(res.Opened), res.Refusals)
+	}
+
+	// Reload from disk.
+	b2, err := NewBook(dir, cfg)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	open, _ := b2.Snapshot()
+	if len(open) != 1 {
+		t.Fatalf("reloaded %d open positions, want 1", len(open))
+	}
+	if open[0].Coin != "KAITO" || open[0].LongVenue != "hyperliquid" {
+		t.Fatalf("reloaded the wrong position: %+v", open[0])
+	}
+	if !open[0].EntryCostMeasured {
+		t.Fatal("entry cost lost its measured flag across a save/load")
+	}
+}
+
+// TestSettlementDetectedByAdvancingTimestamp.
+func TestSettlementDetectedByAdvancingTimestamp(t *testing.T) {
+	b := testBook(t, nil)
+	now := fixedNow
+
+	if _, err := b.Update(now, []Candidate{goodCandidate()}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	// Same timestamps: nothing settled.
+	res, _ := b.Update(now.Add(5*time.Minute), []Candidate{goodCandidate()})
+	if res.Settled != 0 {
+		t.Fatalf("counted %d settlements without the clock advancing", res.Settled)
+	}
+
+	// Long venue's next-funding time advances: one settlement.
+	c := goodCandidate()
+	c.LongNextFundingMs = fixedNow.Add(90 * time.Minute).UnixMilli()
+	res, _ = b.Update(now.Add(time.Hour), []Candidate{c})
+	if res.Settled != 1 {
+		t.Fatalf("counted %d settlements, want 1", res.Settled)
+	}
+
+	open, _ := b.Snapshot()
+	if open[0].LongSettlements != 1 {
+		t.Fatalf("long leg settled %d times, want 1", open[0].LongSettlements)
+	}
+	// Long rate is -24 bps/hr over a 1h interval -> +24 bps to a long.
+	if !near(open[0].LongLegBps, 24, 1e-9) {
+		t.Fatalf("long leg accrued %.4f bps, want 24", open[0].LongLegBps)
+	}
+}
+
+// TestMissingCandidateDoesNotAccrueOrClose.
+//
+// A pair vanishing from the feed is missing INFORMATION. It is not a
+// settlement and it is not an exit signal.
+func TestMissingCandidateDoesNotAccrueOrClose(t *testing.T) {
+	b := testBook(t, nil)
+	now := fixedNow
+
+	if _, err := b.Update(now, []Candidate{goodCandidate()}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	res, err := b.Update(now.Add(time.Hour), nil)
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if res.Settled != 0 {
+		t.Fatalf("accrued %d settlements from an absent feed", res.Settled)
+	}
+	if len(res.Closed) != 0 {
+		t.Fatalf("closed %d positions because the feed went quiet: %v", len(res.Closed), res.Closed)
+	}
+	if res.OpenCount != 1 {
+		t.Fatalf("open count %d, want 1", res.OpenCount)
+	}
+}
+
+// TestOneCoinOnlyOnce. Two directions of the same coin are still one exposure.
+func TestOneCoinOnlyOnce(t *testing.T) {
+	b := testBook(t, nil)
+	now := fixedNow
+
+	other := goodCandidate()
+	other.ShortVenue = "bybit"
+
+	res, err := b.Update(now, []Candidate{goodCandidate(), other})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if len(res.Opened) != 1 {
+		t.Fatalf("opened %d positions on the same coin", len(res.Opened))
+	}
+	if res.Refusals[GateAlreadyHeld] != 1 {
+		t.Fatalf("second leg refused for %v, want ALREADY_HELD", res.Refusals)
+	}
+}
+
+// TestCapacityIsRespected.
+func TestCapacityIsRespected(t *testing.T) {
+	b := testBook(t, func(c *Config) { c.MaxConcurrent = 2 })
+	now := fixedNow
+
+	var cands []Candidate
+	for _, coin := range []string{"AAA", "BBB", "CCC", "DDD"} {
+		c := goodCandidate()
+		c.Coin = coin
+		cands = append(cands, c)
+	}
+
+	res, err := b.Update(now, cands)
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if len(res.Opened) != 2 {
+		t.Fatalf("opened %d against a cap of 2", len(res.Opened))
+	}
+	if res.Refusals[GateAtCapacity] != 2 {
+		t.Fatalf("capacity refusals %v, want 2", res.Refusals)
+	}
+}
+
+// TestShortestBreakEvenWins. Time in the position is the risk.
+func TestShortestBreakEvenWins(t *testing.T) {
+	b := testBook(t, func(c *Config) { c.MaxConcurrent = 1 })
+	now := fixedNow
+
+	slow := goodCandidate()
+	slow.Coin = "SLOW"
+	slow.LongBpsHr, slow.ShortBpsHr = -1.5, 0.5 // spread 2.0 -> 13h
+
+	fast := goodCandidate()
+	fast.Coin = "FAST" // spread 25.3 -> ~1h
+
+	res, err := b.Update(now, []Candidate{slow, fast})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if len(res.Opened) != 1 {
+		t.Fatalf("opened %d, want 1", len(res.Opened))
+	}
+	if !strings.Contains(res.Opened[0], "FAST") {
+		t.Fatalf("took the slower pair: %s", res.Opened[0])
+	}
+}
+
+// TestReturnIsOnCapitalNotNotional.
+//
+// Capital is roughly twice the notional and cannot be moved between venues
+// quickly. Reporting on notional doubles the headline.
+func TestReturnIsOnCapitalNotNotional(t *testing.T) {
+	p := Position{NotionalUSD: 400, CapitalUSD: 800, LongLegBps: 100, EntryCostBps: 0}
+	// net = 100 bps of $400 = $4.00; on $800 of capital that is 0.5%.
+	if !near(p.NetUSD(), 4, 1e-9) {
+		t.Fatalf("net $%.4f, want 4.00", p.NetUSD())
+	}
+	if !near(p.ReturnPct(), 0.5, 1e-9) {
+		t.Fatalf("return %.4f%%, want 0.5 -- 1.0 would be the notional figure", p.ReturnPct())
+	}
+}
+
+// TestSettlementBooksTheRateThatApplied.
+//
+// predictedFundings gives the rate for the NEXT settlement. A settlement
+// detected this pass covers the interval that just ENDED, so it must be booked
+// at the rate observed before this pass, not at the fresh prediction.
+//
+// Hyperliquid settles 24 times a day. Booking each one at the following hour's
+// prediction is a small error made 24 times daily, in whichever direction the
+// rate happens to be trending.
+func TestSettlementBooksTheRateThatApplied(t *testing.T) {
+	b := testBook(t, nil)
+	now := fixedNow
+
+	// Open at -24 bps/hr on the long leg.
+	if _, err := b.Update(now, []Candidate{goodCandidate()}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	// An hour later the rate has collapsed to -1 AND a settlement is detected.
+	// The hour that just ended paid -24, so the long leg must earn +24.
+	c := goodCandidate()
+	c.LongBpsHr = -1.0
+	c.LongNextFundingMs = fixedNow.Add(90 * time.Minute).UnixMilli()
+
+	if _, err := b.Update(now.Add(time.Hour), []Candidate{c}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	open, _ := b.Snapshot()
+	if len(open) != 1 {
+		t.Fatalf("open %d, want 1", len(open))
+	}
+	got := open[0].LongLegBps
+	if !near(got, 24, 1e-9) {
+		t.Fatalf("long leg accrued %.4f bps; want 24 (the rate that applied). "+
+			"1.0 would mean the NEXT hour's prediction was booked against the "+
+			"hour that just ended", got)
+	}
+}
+
+// TestHeldPositionKeepsAccruingWhenItsSpreadFlips.
+//
+// THE ZOMBIE.
+//
+// Candidates are emitted with the profitable leg long, so when a spread crosses
+// zero the feed starts publishing the same pair under reversed labels. The
+// position's key stopped matching, Update treated the pair as vanished, and the
+// position froze: no settlements booked, no exit evaluated, for up to max-hold
+// of thirty days. An archived book from 2026-08-16 contained a KAITO position
+// opened on the 12th and last observed on the 13th.
+//
+// This asserts the behaviour, not the mechanism, so it survives the move to
+// canonical keying.
+func TestHeldPositionKeepsAccruingWhenItsSpreadFlips(t *testing.T) {
+	b := testBook(t, nil)
+	now := fixedNow
+	p := heldPosition(10*time.Hour, now)
+	b.state.Open[p.Key()] = p
+	before := p.LongSettlements + p.ShortSettlements
+
+	// Same coin, same two venues, labels reversed because the spread turned.
+	c := goodCandidate()
+	c.LongVenue, c.ShortVenue = c.ShortVenue, c.LongVenue
+	c.LongBpsHr, c.ShortBpsHr = c.ShortBpsHr, c.LongBpsHr
+	c.LongIntervalHours, c.ShortIntervalHours = c.ShortIntervalHours, c.LongIntervalHours
+	c.LongNextFundingMs = now.Add(2 * time.Hour).UnixMilli()
+	c.ShortNextFundingMs = now.Add(2 * time.Hour).UnixMilli()
+
+	if _, err := b.Update(now, []Candidate{c}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if got := p.LongSettlements + p.ShortSettlements; got == before {
+		t.Fatalf("booked nothing after the spread flipped (%d settlements before and after): the position is frozen", got)
+	}
+}
+
+// TestVanishedPairDoesNotAccrueOrClose.
+//
+// The counterpart to the test above, and the reason that one has to be careful.
+// A pair genuinely absent from the feed is MISSING INFORMATION -- not a
+// settlement and not an exit signal. Accruing against a stale rate would be
+// inventing revenue; closing would be paying a round trip on no evidence.
+func TestVanishedPairDoesNotAccrueOrClose(t *testing.T) {
+	b := testBook(t, nil)
+	now := fixedNow
+	p := heldPosition(10*time.Hour, now)
+	b.state.Open[p.Key()] = p
+	before := p.LongSettlements + p.ShortSettlements
+
+	// A different coin entirely: this position's pair is simply not present.
+	c := goodCandidate()
+	c.Coin = "SOMETHINGELSE"
+	if _, err := b.Update(now, []Candidate{c}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if got := p.LongSettlements + p.ShortSettlements; got != before {
+		t.Fatalf("accrued %d settlements against an absent observation", got-before)
+	}
+	if _, open := b.state.Open[p.Key()]; !open {
+		t.Fatal("closed a position because its pair was briefly missing from the feed")
+	}
+}
+
+// costsFrom writes a JSONL fixture and loads it through the real parser, so
+// these tests cover LoadCosts as well as the gate.
+func costsFrom(t *testing.T, venueA, venueB string, samples []float64) *Costs {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "costs.jsonl")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	for _, v := range samples {
+		// The whole sample is slippage and fees are zero, so a fixture cost of v
+		// stresses to exactly v * exitStressSlipMultiple. Real rows carry a real
+		// split; here the point is that the arithmetic is predictable.
+		fmt.Fprintf(f, `{"venue_a":%q,"venue_b":%q,"cost_total_bps":%g,"slip_total_bps":%g,"fees_bps":0}`+"\n",
+			venueA, venueB, v, v)
+	}
+	f.Close()
+	c, err := LoadCosts(path)
+	if err != nil {
+		t.Fatalf("LoadCosts: %v", err)
+	}
+	return c
+}
+
+// settledCandidate is goodCandidate with settled funding attached.
+//
+// It deliberately builds on the helper that already passes every other gate,
+// rather than hand-constructing a Candidate. An earlier attempt at these tests
+// set ShortEntrySlipBps to -100 -- a venue PAYING you to trade -- to get past
+// unrelated checks and reach the code under test. A test that invents an
+// impossible market to reach its target proves nothing about the real one.
+func settledCandidate(recentBpsHr float64) Candidate {
+	c := goodCandidate()
+	c.SettledKnown = true
+	c.SettledIntervals = 12
+	c.SettledSameSign = 1.0
+	c.SettledSpreadBpsHr = recentBpsHr
+	c.SettledRecentSpreadBpsHr = recentBpsHr
+	c.SettledLongBpsHr = 0
+	c.SettledShortBpsHr = recentBpsHr
+	return c
+}
+
+func repeat(v float64, n int) []float64 {
+	out := make([]float64, n)
+	for i := range out {
+		out[i] = v
+	}
+	return out
+}
+
+// TestNetEdgeGateRefusesAnUnmeasuredPair.
+//
+// The fix for a missing measurement is to measure it, never to substitute a
+// global figure. A p95 from 10 observations is not a percentile.
+func TestNetEdgeGateRefusesAnUnmeasuredPair(t *testing.T) {
+	b := testBook(t, nil)
+	c := settledCandidate(10.0) // richly profitable if it were priced
+	b.Costs = costsFrom(t, c.LongVenue, c.ShortVenue, repeat(20.0, 10))
+
+	a := b.assess(c, fixedNow)
+	if a.Gate != GateCostUnmeasured {
+		t.Fatalf("traded a pair whose cost is unknown: gate %s (%s)", a.Gate, a.Reason)
+	}
+}
+
+// TestNetEdgeGateRefusesWhenCostExceedsExpectedCollection.
+//
+// 3 bps/hr over 5.86 hours is 17.6 bps, against a 40 bps measured cost that
+// stresses to 47 and a 15 bps basis reserve: net -44. Under the old flat
+// threshold of 3.0 this passed, which is how positions were opened that could
+// never repay their own round trip.
+func TestNetEdgeGateRefusesWhenCostExceedsExpectedCollection(t *testing.T) {
+	b := testBook(t, nil)
+	c := settledCandidate(3.0)
+	b.Costs = costsFrom(t, c.LongVenue, c.ShortVenue, repeat(40.0, 60))
+
+	a := b.assess(c, fixedNow)
+	if a.Gate != GateExpectedNetNegative {
+		t.Fatalf("accepted a trade that cannot repay its cost: gate %s (%s)", a.Gate, a.Reason)
+	}
+	if !strings.Contains(a.Reason, "n=60") {
+		t.Fatalf("refusal does not state its sample size: %s", a.Reason)
+	}
+}
+
+// TestNetEdgeGatePassesWhenNetIsPositive.
+//
+// 15 bps/hr over 5.86 hours is 87.9 bps against a 40 bps cost that stresses to
+// 47, plus a 15 bps reserve: net +25.9. The counterpart to the test above -- a
+// gate that only ever refuses is not a gate, it is an outage.
+//
+// This test used 10 bps/hr until 2026-08-22. At 10 the net was +3.6 with the
+// exit priced at the calm book and -3.4 once the exit was priced under stress.
+// That trade was marginal, not "clearly profitable", and the honest response
+// was to pick a spread that genuinely clears rather than soften the gate.
+func TestNetEdgeGatePassesWhenNetIsPositive(t *testing.T) {
+	b := testBook(t, nil)
+	c := settledCandidate(15.0)
+	b.Costs = costsFrom(t, c.LongVenue, c.ShortVenue, repeat(40.0, 60))
+
+	a := b.assess(c, fixedNow)
+	if a.Gate == GateExpectedNetNegative || a.Gate == GateCostUnmeasured {
+		t.Fatalf("refused a clearly profitable trade: gate %s (%s)", a.Gate, a.Reason)
+	}
+}

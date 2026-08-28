@@ -1,0 +1,808 @@
+package funding
+
+import (
+	"encoding/json"
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/imtiyaz/vega-bot/pkg/capital"
+	"github.com/imtiyaz/vega-bot/pkg/economics"
+	"github.com/imtiyaz/vega-bot/pkg/exchange"
+	"strings"
+)
+
+// Position is one simulated cash-and-carry: long spot, short perp.
+//
+// The entry cost is charged the moment it opens and the exit cost the moment
+// it closes. Nothing is deferred, nothing is netted away, and the running PnL
+// starts NEGATIVE by the entry cost. A position that closes early loses money
+// even if funding was positive throughout -- which is precisely the fact the
+// previous bot's monotonic totalFundingEarned counter could not represent.
+type Position struct {
+	ID     string `json:"id"`
+	Venue  string `json:"venue"`
+	Symbol string `json:"symbol"`
+
+	OpenedAt      time.Time `json:"opened_at"`
+	EntryRatePct  float64   `json:"entry_rate_pct"`
+	IntervalHours float64   `json:"interval_hours"`
+
+	NotionalUSD float64 `json:"notional_usd"`
+	// CapitalUSD is roughly 2x notional: the spot leg is bought outright and
+	// the perp leg needs margin. Return is measured against THIS, not notional.
+	CapitalUSD float64 `json:"capital_usd"`
+
+	// EntryCostBps is charged at open: buy spot + short perp, fees plus the
+	// measured half-spread on each book at that moment.
+	EntryCostBps float64 `json:"entry_cost_bps"`
+	// ExitCostBps is charged at close, measured from the book AT CLOSE, not
+	// assumed to equal the entry cost. Books widen when you most want to exit.
+	ExitCostBps float64 `json:"exit_cost_bps"`
+
+	PlannedHoldDays float64 `json:"planned_hold_days"`
+
+	// FundingCollectedBps accumulates SIGNED funding. It decreases when the
+	// rate flips negative. There is no separate "paid" counter, because a
+	// counter that only rises is how a losing bot reports profits.
+	FundingCollectedBps float64 `json:"funding_collected_bps"`
+	IntervalsCollected  int     `json:"intervals_collected"`
+	// MissedSettlements counts intervals that elapsed between two polls and
+	// were therefore booked at a single observed rate rather than their own.
+	// A non-zero value is a measure of how much to distrust FundingCollectedBps.
+	MissedSettlements int `json:"missed_settlements,omitempty"`
+	// UnobservedSettlements counts settlements credited with the rate observed
+	// AFTER the boundary because no earlier observation existed.
+	UnobservedSettlements int `json:"unobserved_settlements,omitempty"`
+	NegativeIntervals     int `json:"negative_intervals"`
+
+	// AdverseSettlements counts EVERY settlement booked at a negative rate over
+	// the life of the position. NegativeIntervals above is a CONSECUTIVE streak
+	// that resets on the first positive settlement, which makes a position that
+	// alternates look identical to one that never went negative at all.
+	//
+	// HYPEUSDT on 2026-08-22 read negative_intervals: 0 while having collected
+	// 3.75 bps across 33 settlements, where the venue's own recent rate implied
+	// roughly 22. The shortfall was early negative settlements giving the funding
+	// back. Nothing in the record showed them, and an hour was spent looking for
+	// a bug that was not there.
+	AdverseSettlements int `json:"adverse_settlements,omitempty"`
+
+	// AdverseBps is the funding handed back at those settlements, signed
+	// negative. Two positions with the same collected total are not the same
+	// position if one of them earned 20 and returned 16.
+	AdverseBps       float64   `json:"adverse_bps,omitempty"`
+	LastSettlementAt time.Time `json:"last_settlement_at"`
+	NextFundingTime  time.Time `json:"next_funding_time"`
+
+	// Mark-to-market fields, refreshed every poll while open.
+	LastRatePct float64   `json:"last_rate_pct"`
+	LastSeenAt  time.Time `json:"last_seen_at"`
+
+	ClosedAt    time.Time `json:"closed_at,omitempty"`
+	CloseReason string    `json:"close_reason,omitempty"`
+}
+
+// Closed reports whether the position has been closed.
+func (p *Position) Closed() bool { return !p.ClosedAt.IsZero() }
+
+// HeldDays is elapsed time in days, open or closed.
+func (p *Position) HeldDays(now time.Time) float64 {
+	end := now
+	if p.Closed() {
+		end = p.ClosedAt
+	}
+	return end.Sub(p.OpenedAt).Hours() / 24
+}
+
+// NetBps is funding collected minus every cost incurred SO FAR.
+//
+// While open, the exit cost has not been paid yet but is unavoidable, so it is
+// included as a liability. A position is not profitable until it has covered
+// the cost of getting out as well as in -- pretending otherwise is how a bot
+// reports a gain it can never realise.
+func (p *Position) NetBps() float64 {
+	exit := p.ExitCostBps
+	if !p.Closed() {
+		// Not yet paid, but committed. Estimate it as symmetric with entry.
+		exit = p.EntryCostBps
+	}
+	return p.FundingCollectedBps - p.EntryCostBps - exit
+}
+
+// NetUSD applies NetBps to notional.
+func (p *Position) NetUSD() float64 { return p.NetBps() / 10000 * p.NotionalUSD }
+
+// ReturnOnCapitalPct is the honest return figure: against deployed capital,
+// which is roughly twice the notional.
+func (p *Position) ReturnOnCapitalPct() float64 {
+	if p.CapitalUSD <= 0 {
+		return 0
+	}
+	return p.NetUSD() / p.CapitalUSD * 100
+}
+
+// PaperConfig governs the simulated book.
+type PaperConfig struct {
+	// MaxConcurrent caps how many positions can be open at once. Capital is
+	// finite; a rig that opens 200 positions is measuring a portfolio nobody
+	// could fund.
+	MaxConcurrent int
+
+	// PlannedHoldDays is the horizon the entry gate is computed against and
+	// the maximum time a position is held.
+	PlannedHoldDays float64
+
+	// CloseOnNegativeFunding exits when the short leg starts paying. This is
+	// risk 1 from the brief and it needs an automated exit, not a hope.
+	CloseOnNegativeFunding bool
+
+	// NegativeIntervalsBeforeExit tolerates a single adverse settlement before
+	// closing. One negative print is noise; two is a regime.
+	NegativeIntervalsBeforeExit int
+
+	// ReenterCooldown stops a symbol being reopened immediately after close.
+	// Without it, a rate hovering at the gate produces open/close churn and
+	// pays the round trip every cycle -- which is bug 3 of the previous bot,
+	// rotation churn, reappearing in paper form.
+	ReenterCooldown time.Duration
+
+	// --- ENTRY FILTERS ---
+	//
+	// These were hardcoded inside Book.Update until 2026-08-11, which meant
+	// every filter change made to cmd/scan and cmd/monitor silently failed to
+	// reach the thing that actually opens positions. The scanner reported
+	// sixteen candidates while the book was still refusing everything that did
+	// not clear a $50M floor at $10,000 notional.
+	//
+	// A configuration knob that does not reach the code it names is worse than
+	// no knob: it produces confident, wrong beliefs about what the system is
+	// doing. Zero on any of these falls back to the old constant so an older
+	// positions.json cannot silently disable a filter.
+	NotionalUSD             float64
+	MinQuoteVolume24hUSD    float64
+	MinTopOfBookFraction    float64
+	MaxRoundTripSlippageBps float64
+
+	// MinHoldDays blocks a VOLUNTARY exit before this many days have passed.
+	//
+	// The reasoning is that the exit cost is already sunk the moment you enter.
+	// You have committed to paying ~16 bps to get out whenever you get out, so
+	// closing early saves nothing -- it just guarantees you paid the full ~32 bps
+	// round trip to collect a fraction of a basis point.
+	//
+	// Measured on 2026-08-06: average round trip 31.8 bps, average funding 2.1
+	// bps/day, break-even ~15 days, actual average hold 0.48 days. Six positions,
+	// all closed before earning anything, -186 bps total. That is bug 3 of the
+	// previous bot -- rotation churn -- arriving through the exit rule instead of
+	// through rotation.
+	//
+	// This does NOT override the stop loss or the unconditional exits below.
+	MinHoldDays float64
+
+	// StopLossBps closes a position whose net has fallen this far, regardless of
+	// MinHoldDays. NEGATIVE value.
+	//
+	// This is the escape hatch that makes MinHoldDays safe: a genuine regime flip
+	// that keeps bleeding will trip this and close. What MinHoldDays removes is
+	// closing on noise; what StopLossBps preserves is closing on damage.
+	StopLossBps float64
+}
+
+// constraints builds the entry gate from config, falling back to the values
+// that were hardcoded before these fields existed.
+//
+// The fallbacks are NOT a convenience. A config loaded from an older file has
+// zeros in these fields, and a zero MinQuoteVolume24hUSD would disable the
+// volume floor entirely rather than leaving it alone.
+func (c PaperConfig) constraints() exchange.Constraints {
+	notional := c.NotionalUSD
+	if notional <= 0 {
+		notional = 10000
+	}
+	minVol := c.MinQuoteVolume24hUSD
+	if minVol <= 0 {
+		minVol = 50_000_000
+	}
+	depth := c.MinTopOfBookFraction
+	if depth <= 0 {
+		depth = 0.25
+	}
+	slip := c.MaxRoundTripSlippageBps
+	if slip <= 0 {
+		slip = 8
+	}
+	return exchange.Constraints{
+		NotionalUSD:              notional,
+		HoldDays:                 c.PlannedHoldDays,
+		MinQuoteVolume24hUSD:     minVol,
+		MinTopOfBookFraction:     depth,
+		MaxRoundTripSlippageBps:  slip,
+		RequireMeasuredLiquidity: true,
+	}
+}
+
+// DefaultPaperConfig is deliberately conservative.
+func DefaultPaperConfig() PaperConfig {
+	return PaperConfig{
+		MaxConcurrent:               5,
+		PlannedHoldDays:             30,
+		CloseOnNegativeFunding:      true,
+		NegativeIntervalsBeforeExit: 6,
+		MinHoldDays:                 2,
+		StopLossBps:                 -60,
+		ReenterCooldown:             24 * time.Hour,
+		NotionalUSD:                 10000,
+		MinQuoteVolume24hUSD:        50_000_000,
+		MinTopOfBookFraction:        0.25,
+		MaxRoundTripSlippageBps:     8,
+	}
+}
+
+// Book holds open and closed paper positions and persists them to disk.
+//
+// Persistence matters more than it looks: the service will restart during
+// three months, and positions that vanish on restart would silently reset the
+// track record to zero while the process looked healthy.
+type Book struct {
+	mu   sync.Mutex
+	cfg  PaperConfig
+	path string
+
+	// Capital enforces this book's TOTAL capital ceiling across every open
+	// position. Nil means unlimited, which is the behaviour that existed
+	// before the ledger and is what every test assumes.
+	//
+	// EXCLUDED FROM JSON DELIBERATELY. saveLocked marshals this struct
+	// whole, so an included ledger would be written into positions.json and
+	// read back with empty internals -- reporting the full principal free
+	// while positions were open against it. The ledger persists separately,
+	// in capital_<book>.json.
+	Capital *capital.Ledger `json:"-"`
+
+	Open     map[string]*Position `json:"open"`
+	Closed   []*Position          `json:"closed"`
+	LastExit map[string]time.Time `json:"last_exit"`
+	Seq      int                  `json:"seq"`
+}
+
+// NewBook loads an existing book from disk or creates an empty one.
+func NewBook(dataDir string, cfg PaperConfig) (*Book, error) {
+	b := &Book{
+		cfg:      cfg,
+		path:     filepath.Join(dataDir, "positions.json"),
+		Open:     map[string]*Position{},
+		LastExit: map[string]time.Time{},
+	}
+	data, err := os.ReadFile(b.path)
+	if os.IsNotExist(err) {
+		return b, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("paper: reading %s: %w", b.path, err)
+	}
+	if err := json.Unmarshal(data, b); err != nil {
+		return nil, fmt.Errorf("paper: parsing %s: %w", b.path, err)
+	}
+	if b.Open == nil {
+		b.Open = map[string]*Position{}
+	}
+	if b.LastExit == nil {
+		b.LastExit = map[string]time.Time{}
+	}
+	return b, nil
+}
+
+// Save writes the book atomically. A half-written positions file after a
+// crash would be worse than none.
+func (b *Book) Save() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.saveLocked()
+}
+
+func (b *Book) saveLocked() error {
+	data, err := json.MarshalIndent(b, "", "  ")
+	if err != nil {
+		return fmt.Errorf("paper: marshalling book: %w", err)
+	}
+	tmp := b.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o640); err != nil {
+		return fmt.Errorf("paper: writing %s: %w", tmp, err)
+	}
+	return os.Rename(tmp, b.path)
+}
+
+// Event is something that happened to the book this poll, for journaling.
+type Event struct {
+	Type   string `json:"type"` // "paper_open" or "paper_close"
+	TsMs   int64  `json:"ts_ms"`
+	Venue  string `json:"venue"`
+	Symbol string `json:"symbol"`
+	ID     string `json:"id"`
+
+	RatePct       float64 `json:"rate_pct"`
+	NotionalUSD   float64 `json:"notional_usd"`
+	CapitalUSD    float64 `json:"capital_usd"`
+	EntryCostBps  float64 `json:"entry_cost_bps"`
+	ExitCostBps   float64 `json:"exit_cost_bps,omitempty"`
+	FundingBps    float64 `json:"funding_bps"`
+	Intervals     int     `json:"intervals,omitempty"`
+	NetBps        float64 `json:"net_bps"`
+	NetUSD        float64 `json:"net_usd"`
+	ReturnOnCapit float64 `json:"return_on_capital_pct"`
+	HeldDays      float64 `json:"held_days,omitempty"`
+	Reason        string  `json:"reason,omitempty"`
+}
+
+// Update advances the book by one poll: accrues funding on open positions,
+// closes those that must close, and opens new ones where the gate allows.
+//
+// Returns events to be journaled. The caller journals them; this package does
+// not write to the journal so that the book can be unit-tested without one.
+func (b *Book) Update(now time.Time, obs []exchange.Observation, venues map[string]exchange.Venue) []Event {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	var capEvents []Event
+	if b.Capital != nil {
+		// Free capital still held against positions this book no longer has
+		// open. Without this, one crash between closing a position and
+		// releasing its capital leaks that capital for good -- the book would
+		// begin refusing trades it could plainly afford, with nothing in the
+		// record to say why.
+		openKeys := make([]string, 0, len(b.Open))
+		for k := range b.Open {
+			openKeys = append(openKeys, k)
+		}
+		freed, err := b.Capital.Reconcile(openKeys)
+		switch {
+		case err != nil:
+			// Update cannot return an error, so this is journalled rather than
+			// swallowed. A silent capital failure is how a ceiling stops being
+			// a ceiling.
+			capEvents = append(capEvents, Event{
+				Type: "capital_error", TsMs: now.UnixMilli(),
+				Reason: "reconcile failed: " + err.Error(),
+			})
+		case len(freed) > 0:
+			for _, id := range freed {
+				capEvents = append(capEvents, Event{
+					Type: "capital_reclaimed", TsMs: now.UnixMilli(), ID: id,
+					Reason: "held capital had no matching open position",
+				})
+			}
+		}
+	}
+
+	byKey := make(map[string]exchange.Observation, len(obs))
+	for _, o := range obs {
+		byKey[key(o.Venue, o.Symbol)] = o
+	}
+
+	events := capEvents
+
+	// --- accrue and close -------------------------------------------------
+	for k, p := range b.Open {
+		o, seen := byKey[k]
+		if seen {
+			b.accrue(p, o, now)
+		}
+
+		reason := b.exitReason(p, o, seen, now)
+		if reason == "" {
+			continue
+		}
+
+		// Exit cost measured from the book AT CLOSE, not assumed symmetric.
+		p.ExitCostBps = exitCostFor(o, seen, venues[p.Venue], p.EntryCostBps)
+		p.ClosedAt = now
+		p.CloseReason = reason
+
+		b.Closed = append(b.Closed, p)
+		delete(b.Open, k)
+		b.LastExit[k] = now
+		if b.Capital != nil {
+			// A failed release is deliberately not fatal. Reconcile at the top
+			// of the next Update frees any hold without a matching position, so
+			// this self-heals within one cycle.
+			_, _, _ = b.Capital.Release(k)
+		}
+
+		events = append(events, Event{
+			Type: "paper_close", TsMs: now.UnixMilli(),
+			Venue: p.Venue, Symbol: p.Symbol, ID: p.ID,
+			RatePct: p.LastRatePct, NotionalUSD: p.NotionalUSD, CapitalUSD: p.CapitalUSD,
+			EntryCostBps: p.EntryCostBps, ExitCostBps: p.ExitCostBps,
+			FundingBps: p.FundingCollectedBps, Intervals: p.IntervalsCollected,
+			NetBps: p.NetBps(), NetUSD: p.NetUSD(), ReturnOnCapit: p.ReturnOnCapitalPct(),
+			HeldDays: p.HeldDays(now), Reason: reason,
+		})
+	}
+
+	// --- open ---------------------------------------------------------------
+	if len(b.Open) >= b.cfg.MaxConcurrent {
+		return events
+	}
+
+	type cand struct {
+		o   exchange.Observation
+		a   economics.Assessment
+		net float64
+	}
+	var cands []cand
+
+	// Every observation is accounted for. A candidate that vanishes without
+	// a counter is indistinguishable from one that was never seen, and the
+	// difference between those two is the whole diagnosis.
+	refusals := map[string]int{}
+	assessed := 0
+
+	for _, o := range obs {
+		k := key(o.Venue, o.Symbol)
+		if _, already := b.Open[k]; already {
+			refusals["ALREADY_HELD"]++
+			continue
+		}
+		if last, ok := b.LastExit[k]; ok && now.Sub(last) < b.cfg.ReenterCooldown {
+			refusals["REENTRY_COOLDOWN"]++
+			continue
+		}
+		v, known := venues[o.Venue]
+		if !known {
+			refusals["VENUE_NOT_REGISTERED"]++
+			continue
+		}
+		cons := b.cfg.constraints()
+		assessed++
+		a, err := exchange.Assess(v, o, cons)
+		if err != nil || !a.Viable {
+			g := a.Gate
+			if g == "" {
+				// A refusal with no gate is a bug in Assess, not a category.
+				// Naming it loudly beats folding it into a neighbour and
+				// reporting a tidy table that is quietly wrong.
+				g = "UNCLASSIFIED"
+			}
+			refusals[g]++
+			continue
+		}
+		cands = append(cands, cand{o: o, a: a, net: a.NetBps})
+	}
+
+	sort.Slice(cands, func(i, j int) bool { return cands[i].net > cands[j].net })
+
+	var capSkipped int
+	var capReason string
+	for _, c := range cands {
+		if len(b.Open) >= b.cfg.MaxConcurrent {
+			break
+		}
+		// Skip quietly when the book cannot fund this candidate, and say so
+		// once per poll rather than once per symbol. A refusal repeated for
+		// every candidate on every poll is not more information than saying
+		// it once; it is the same information made harder to find.
+		//
+		// Hold below remains the authority. CanFund can go stale between the
+		// check and the take, and a ceiling enforced by an advisory check is
+		// not a ceiling.
+		if b.Capital != nil && !b.Capital.CanFund(c.a.CapitalUSD) {
+			capSkipped++
+			if capReason == "" {
+				capReason = fmt.Sprintf("needs $%.2f per position, $%.2f free",
+					c.a.CapitalUSD, b.Capital.Free())
+			}
+			continue
+		}
+		b.Seq++
+		p := &Position{
+			ID:              fmt.Sprintf("%s-%s-%d", c.o.Venue, c.o.Symbol, b.Seq),
+			Venue:           c.o.Venue,
+			Symbol:          c.o.Symbol,
+			OpenedAt:        now,
+			EntryRatePct:    c.o.FundingRatePct,
+			IntervalHours:   c.o.IntervalHours,
+			NotionalUSD:     c.a.NotionalUSD,
+			CapitalUSD:      c.a.CapitalUSD,
+			EntryCostBps:    c.a.CostBps / 2, // half the round trip is the entry
+			PlannedHoldDays: b.cfg.PlannedHoldDays,
+			NextFundingTime: c.o.NextFundingTime,
+			LastRatePct:     c.o.FundingRatePct,
+			LastSeenAt:      now,
+		}
+		if b.Capital != nil {
+			// Take the capital BEFORE the position is recorded, and skip the
+			// candidate if the book cannot fund it. A position whose capital was
+			// never actually available is not a smaller position -- it is a
+			// false measurement, and every figure derived from it inherits that.
+			//
+			// b.Seq was already incremented, so a refusal leaves a gap in the ID
+			// sequence. That is correct: the attempt happened.
+			if err := b.Capital.Hold(key(p.Venue, p.Symbol), p.CapitalUSD,
+				p.NotionalUSD, capital.CashAndCarry, p.Symbol, now); err != nil {
+				events = append(events, Event{
+					Type: "capital_refused", TsMs: now.UnixMilli(),
+					Venue: p.Venue, Symbol: p.Symbol, ID: p.ID,
+					NotionalUSD: p.NotionalUSD, CapitalUSD: p.CapitalUSD,
+					Reason: err.Error(),
+				})
+				continue
+			}
+		}
+
+		b.Open[key(p.Venue, p.Symbol)] = p
+
+		events = append(events, Event{
+			Type: "paper_open", TsMs: now.UnixMilli(),
+			Venue: p.Venue, Symbol: p.Symbol, ID: p.ID,
+			RatePct: p.EntryRatePct, NotionalUSD: p.NotionalUSD, CapitalUSD: p.CapitalUSD,
+			EntryCostBps: p.EntryCostBps,
+			NetBps:       p.NetBps(), NetUSD: p.NetUSD(),
+			Reason: c.a.Reason,
+		})
+	}
+
+	// One line per poll, gates ordered by how many they stopped. This is
+	// the report that says whether a threshold is calibrated or is quietly
+	// excluding everything worth trading.
+	if len(refusals) > 0 {
+		keys := make([]string, 0, len(refusals))
+		for g := range refusals {
+			keys = append(keys, g)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			if refusals[keys[i]] != refusals[keys[j]] {
+				return refusals[keys[i]] > refusals[keys[j]]
+			}
+			return keys[i] < keys[j]
+		})
+		parts := make([]string, 0, len(keys))
+		for _, g := range keys {
+			parts = append(parts, fmt.Sprintf("%s=%d", g, refusals[g]))
+		}
+		events = append(events, Event{
+			Type: "gate_tally", TsMs: now.UnixMilli(),
+			Reason: fmt.Sprintf("%d observed, %d assessed, %d viable | %s",
+				len(obs), assessed, len(cands), strings.Join(parts, " ")),
+		})
+	}
+
+	if capSkipped > 0 {
+		events = append(events, Event{
+			Type: "capital_full", TsMs: now.UnixMilli(),
+			Reason: fmt.Sprintf("%d candidates skipped: %s", capSkipped, capReason),
+		})
+	}
+
+	return events
+}
+
+// accrue credits funding when a settlement boundary has passed.
+//
+// THE RATE THAT APPLIED IS THE ONE OBSERVED BEFORE THE BOUNDARY, NOT AFTER IT.
+//
+// o.FundingRatePct is the venue's prediction for the interval about to START.
+// Crediting it to the interval that just ENDED was the defect: on 2026-08-19 an
+// external code review found this booking the next interval's rate against the
+// past one, and counting exactly one settlement however many had elapsed. The
+// identical pair of defects was found and fixed in pkg/crossvenue two days
+// earlier; nobody checked whether the same shape existed here. It did, and it
+// invalidated the 2.9%/yr cash-and-carry figure this project had been quoting.
+//
+// The comment that used to sit here said funding was "credited at the rate
+// observed closest to settlement". That was the correct intent. The code did
+// the opposite.
+//
+// Signed: a negative rate reduces the accumulated total.
+func (b *Book) accrue(p *Position, o exchange.Observation, now time.Time) {
+	// Capture the rate that applied to the interval now ending BEFORE the new
+	// observation overwrites it.
+	prevRate, havePrev := p.LastRatePct, !p.LastSeenAt.IsZero()
+
+	p.LastRatePct = o.FundingRatePct
+	p.LastSeenAt = now
+
+	// A settlement happened if the funding time we were waiting for is now in
+	// the past, and the exchange has moved on to a later one.
+	if p.NextFundingTime.IsZero() {
+		p.NextFundingTime = o.NextFundingTime
+		return
+	}
+	if !o.NextFundingTime.After(p.NextFundingTime) {
+		return
+	}
+
+	// How many settlements actually elapsed? A 5-minute poll normally catches
+	// each boundary, but a restart, a venue outage or a rate-limit stall can
+	// step over several. Booking one is how 19 settlements got recorded where
+	// 23 had occurred, always on the paying leg.
+	n := 1
+	if o.IntervalHours > 0 {
+		gap := o.NextFundingTime.Sub(p.NextFundingTime).Hours()
+		if k := int(math.Round(gap / o.IntervalHours)); k > 1 {
+			n = k
+			p.MissedSettlements += k - 1
+		}
+	}
+
+	rate := prevRate
+	if !havePrev {
+		// No observation before the boundary. Use the current one and record
+		// that this settlement is less trustworthy than the others.
+		rate = o.FundingRatePct
+		p.UnobservedSettlements++
+	}
+
+	p.FundingCollectedBps += rate * 100 * float64(n)
+	p.IntervalsCollected += n
+	if rate < 0 {
+		p.NegativeIntervals += n
+		p.AdverseSettlements += n
+		p.AdverseBps += rate * 100 * float64(n)
+	} else {
+		p.NegativeIntervals = 0
+	}
+	p.LastSettlementAt = p.NextFundingTime
+	p.NextFundingTime = o.NextFundingTime
+}
+
+// exitReason decides whether to close, and says why in plain words so the
+// ledger explains itself three months from now.
+func (b *Book) exitReason(p *Position, o exchange.Observation, seen bool, now time.Time) string {
+	if !seen {
+		// Delisted or dropped from the feed. Close rather than carry a
+		// position whose price we can no longer observe.
+		if now.Sub(p.LastSeenAt) > 6*time.Hour {
+			return "symbol not observed for 6h; closing rather than carrying an unmeasurable position"
+		}
+		return ""
+	}
+
+	// --- UNCONDITIONAL. The hedge is broken or the horizon is reached. ---
+	// These ignore MinHoldDays because they are not judgement calls.
+
+	if !o.SpotSymbolAvailable {
+		return "spot pair disappeared; the hedge can no longer be maintained"
+	}
+	if p.HeldDays(now) >= p.PlannedHoldDays {
+		return fmt.Sprintf("planned hold of %.0f days reached", p.PlannedHoldDays)
+	}
+
+	// --- STOP LOSS. Always active, including inside MinHoldDays. ---
+	//
+	// This is what makes holding through negative funding defensible. A
+	// position that is merely not earning yet gets to keep running; one that is
+	// actively bleeding past the limit does not.
+	if b.cfg.StopLossBps < 0 && p.NetBps() <= b.cfg.StopLossBps {
+		return fmt.Sprintf("stop loss: net %.2f bps at or beyond the %.2f bps limit after %.2f days",
+			p.NetBps(), b.cfg.StopLossBps, p.HeldDays(now))
+	}
+
+	// --- NEGATIVE FUNDING. Only after the position has had time to earn. ---
+	//
+	// Exiting here before MinHoldDays crystallises the full round trip in
+	// exchange for avoiding a few more small negative settlements. That trade is
+	// almost always bad: the round trip is ~32 bps and one negative settlement
+	// is well under 1 bp.
+	if b.cfg.CloseOnNegativeFunding && p.NegativeIntervals >= b.cfg.NegativeIntervalsBeforeExit {
+		if p.HeldDays(now) < b.cfg.MinHoldDays {
+			// Too new to judge. Floor against instant churn.
+			return ""
+		}
+		if p.NetBps() < 0 {
+			// STILL UNDERWATER. Exiting now crystallises the whole round trip
+			// in exchange for avoiding a few more sub-basis-point settlements.
+			//
+			// Measured 2026-08-07: round trip 38-39 bps against ~2.1 bps/day of
+			// funding, so break-even is ~19 days. A calendar rule cannot express
+			// that, because a position earning 2.8 bps/day breaks even in 14 days
+			// and one earning 1.3 takes 30. So the rule is the condition itself:
+			// hold while underwater.
+			//
+			// This is bounded on two sides and cannot run away: StopLossBps
+			// closes it if the loss deepens, PlannedHoldDays closes it at 30 days
+			// regardless. Neither is subject to this branch.
+			return ""
+		}
+		return fmt.Sprintf("funding negative for %d consecutive settlements after %.1f days held; the short leg is paying",
+			p.NegativeIntervals, p.HeldDays(now))
+	}
+
+	return ""
+}
+
+// exitCostFor measures the exit at close. If the symbol is no longer
+// observable, fall back to the entry cost -- pessimistic would be better but
+// inventing a number is worse than reusing a measured one.
+func exitCostFor(o exchange.Observation, seen bool, v exchange.Venue, entryCostBps float64) float64 {
+	if !seen || !o.LiquidityMeasured {
+		return entryCostBps
+	}
+	fees := o.EffectiveFees(v.Fees)
+	return fees.RoundTripBps() / 2
+}
+
+// Stats summarises the whole book.
+type Stats struct {
+	OpenCount   int     `json:"open_count"`
+	ClosedCount int     `json:"closed_count"`
+	Wins        int     `json:"wins"`
+	Losses      int     `json:"losses"`
+	TotalNetBps float64 `json:"total_net_bps"`
+	TotalNetUSD float64 `json:"total_net_usd"`
+	BestNetBps  float64 `json:"best_net_bps"`
+	WorstNetBps float64 `json:"worst_net_bps"`
+	MeanHoldDay float64 `json:"mean_hold_days"`
+	TotalFunded float64 `json:"total_funding_bps"`
+	TotalCost   float64 `json:"total_cost_bps"`
+}
+
+// Stats computes the ledger summary. Note there is no "total earned" figure
+// that excludes costs: every total here is net.
+func (b *Book) Stats(now time.Time) Stats {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	s := Stats{OpenCount: len(b.Open), ClosedCount: len(b.Closed)}
+	s.BestNetBps = -1e18
+	s.WorstNetBps = 1e18
+
+	var holdSum float64
+	all := make([]*Position, 0, len(b.Open)+len(b.Closed))
+	all = append(all, b.Closed...)
+	for _, p := range b.Open {
+		all = append(all, p)
+	}
+
+	for _, p := range all {
+		n := p.NetBps()
+		s.TotalNetBps += n
+		s.TotalNetUSD += p.NetUSD()
+		s.TotalFunded += p.FundingCollectedBps
+		s.TotalCost += p.EntryCostBps + p.ExitCostBps
+		if n > 0 {
+			s.Wins++
+		} else {
+			s.Losses++
+		}
+		if n > s.BestNetBps {
+			s.BestNetBps = n
+		}
+		if n < s.WorstNetBps {
+			s.WorstNetBps = n
+		}
+		holdSum += p.HeldDays(now)
+	}
+	if len(all) > 0 {
+		s.MeanHoldDay = holdSum / float64(len(all))
+	} else {
+		s.BestNetBps, s.WorstNetBps = 0, 0
+	}
+	return s
+}
+
+// Snapshot returns copies of open and closed positions for reporting.
+func (b *Book) Snapshot() ([]Position, []Position) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	open := make([]Position, 0, len(b.Open))
+	for _, p := range b.Open {
+		open = append(open, *p)
+	}
+	sort.Slice(open, func(i, j int) bool { return open[i].OpenedAt.Before(open[j].OpenedAt) })
+
+	closed := make([]Position, 0, len(b.Closed))
+	for _, p := range b.Closed {
+		closed = append(closed, *p)
+	}
+	sort.Slice(closed, func(i, j int) bool { return closed[i].ClosedAt.After(closed[j].ClosedAt) })
+
+	return open, closed
+}
+
+func key(venue, symbol string) string { return venue + ":" + symbol }

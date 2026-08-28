@@ -1,0 +1,65 @@
+package crossvenue
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+// The stressed figure must scale slippage and leave fees alone. A test that
+// only checks "stressed > measured" would pass even if fees were scaled too,
+// so these assert the exact arithmetic.
+func TestStressedCostScalesSlippageNotFees(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "m.jsonl")
+	// fees 21 (binance+bybit round trip), slippage 40 -> measured 61.
+	// stressed = 21 + 40*1.175 = 68.0
+	line := `{"venue_a":"binance","venue_b":"bybit","cost_total_bps":61,"slip_total_bps":40,"fees_bps":21}` + "\n"
+	body := ""
+	for i := 0; i < 50; i++ {
+		body += line
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadCosts(path, 0)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	got, n := c.P95CostBps("binance", "bybit")
+	if n != 50 || got != 61 {
+		t.Errorf("measured: got %v (n=%d), want 61 (n=50)", got, n)
+	}
+	want := 21 + 40*1.175
+	gotS, nS := c.P95StressedCostBps("binance", "bybit")
+	if nS != 50 {
+		t.Fatalf("stressed sample count %d, want 50", nS)
+	}
+	if diff := gotS - want; diff > 0.001 || diff < -0.001 {
+		t.Errorf("stressed: got %v, want %v — fees must not be scaled", gotS, want)
+	}
+	if gotS <= got {
+		t.Errorf("stressed %v must exceed measured %v", gotS, got)
+	}
+}
+
+// A row without the slippage split cannot be stressed. It must be excluded
+// rather than approximated, so the caller refuses on sample count.
+func TestRowWithoutSlipSplitIsExcludedFromStressed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "m.jsonl")
+	body := `{"venue_a":"okx","venue_b":"mexc","cost_total_bps":50}` + "\n"
+	body += `{"venue_a":"okx","venue_b":"mexc","cost_total_bps":50,"slip_total_bps":30,"fees_bps":20}` + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadCosts(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, n := c.P95CostBps("okx", "mexc"); n != 2 {
+		t.Errorf("measured samples %d, want 2", n)
+	}
+	if _, n := c.P95StressedCostBps("okx", "mexc"); n != 1 {
+		t.Errorf("stressed samples %d, want 1 — the split-less row must be skipped", n)
+	}
+}

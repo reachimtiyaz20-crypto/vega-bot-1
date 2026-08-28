@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "headline $400 cash-and-carry on vega.service -- the defensible number.",
+    "reverse $1600 short-spot/long-perp on vega-reverse.service, replacing the",
+    "cross-venue research book which opened zero positions in two days while",
+    "reverse carry measured +1,744 bps over 19 days on taker fills alone.",
+    "reserve_frac 0 is PAPER ONLY and must rise to ~0.30 before real money."
+  ],
+  "books": [
+    {
+      "name": "headline",
+      "service": "vega",
+      "principal": 400,
+      "reserve_frac": 0.0,
+      "structures": [
+        "cash_and_carry"
+      ]
+    },
+    {
+      "name": "reverse",
+      "service": "vega-reverse",
+      "principal": 1600,
+      "reserve_frac": 0.0,
+      "structures": [
+        "cash_and_carry"
+      ]
+    }
+  ]
+}

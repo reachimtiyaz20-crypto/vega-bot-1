@@ -1,0 +1,1023 @@
+// Package dashboard serves a read-only status page over HTTP.
+//
+// It reads the journal, not the live exchange. That is deliberate: the point
+// of this page is to show what has actually been RECORDED over three months,
+// not to re-poll and show a number that agrees with nothing on disk. If the
+// monitor has stopped writing, this page shows stale timestamps rather than
+// cheerfully fetching fresh data and hiding the outage.
+//
+// It binds to localhost by default. The box is under continuous SSH
+// brute-force, and there is no authentication here. Reach it with a tunnel:
+//
+//	ssh -L 8081:localhost:8081 root@<host>
+//	then open http://localhost:8081
+package dashboard
+
+import (
+	"encoding/json"
+	"fmt"
+	"html/template"
+	"net/http"
+	"sort"
+	"time"
+
+	"github.com/imtiyaz/vega-bot/pkg/exchange"
+	"github.com/imtiyaz/vega-bot/pkg/funding"
+	"github.com/imtiyaz/vega-bot/pkg/journal"
+)
+
+// Server serves the status page.
+type Server struct {
+	JournalDir string
+	Registry   *exchange.Registry
+	StartedAt  time.Time
+
+	// DataDir is the parent of journal/, and holds positions.json and
+	// dispersion/log.jsonl. Empty disables the position and P&L sections
+	// rather than rendering them as zeros -- a blank table and a
+	// misconfigured reader must not look the same.
+	DataDir string
+
+	// CrossDataDir holds cross_positions.json. Empty means use DataDir.
+	//
+	// The cross-venue book moved to data/union/ when cmd/cross was superseded by
+	// cmd/cross (union universe), and the dashboard kept reading the old path --
+	// showing a book whose writer had stopped as though it were live.
+	CrossDataDir string
+	// ReverseDataDir holds the reverse book's positions.json and capital ledger.
+	//
+	// Empty means the section is not rendered at all. That is deliberately
+	// distinct from "pointed at a reverse book that has opened nothing": a
+	// dashboard that cannot see a book and a book with no positions must never
+	// look the same, which is exactly the confusion the "no position opened yet"
+	// budget row was creating while reverse ran unwatched in data/reverse/.
+	ReverseDataDir string
+}
+
+// Snapshot is everything the page renders.
+type Snapshot struct {
+	GeneratedAt  time.Time
+	JournalDir   string
+	Days         []string
+	JournalBytes int64
+	JournalFiles int
+	Uptime       string
+
+	Latest       *funding.Record
+	LatestAgeSec int64
+	Stale        bool
+
+	Venues []VenueView
+
+	// Passed and Refused are kept apart on purpose. Sorting them together by
+	// net bps puts refused symbols at the top -- they show the highest raw
+	// numbers precisely BECAUSE they are illiquid -- and buries the one
+	// symbol that is actually tradeable. That is the same defect the scanner
+	// was rebuilt to remove.
+	Passed  []SymbolView
+	Refused []SymbolView
+	Gates   []GateCount
+
+	TotalObs   int
+	PassingObs int
+
+	NetMin    float64
+	NetMedian float64
+	NetMax    float64
+	NetMean   float64
+
+	Err string
+
+	// --- paper book, read from positions.json ---
+	Ledger          LedgerView
+	OpenPositions   []PositionView
+	ClosedPositions []PositionView
+
+	// --- cross-venue perp-perp, read from dispersion/log.jsonl ---
+	// --- cross-venue perp-perp POSITIONS, from cross_positions.json ---
+	CrossOpen   []CrossPositionView
+	CrossClosed []CrossPositionView
+	CrossLedger CrossLedgerView
+
+	// --- live cross-venue candidates, borrow rates, leverage, venues ---
+	Candidates    []CandidateRow
+	CandidatesAt  time.Time
+	Borrow        []BorrowRow
+	BorrowAt      time.Time
+	BorrowUSDTPct float64
+	Leverage      []LeverageRow
+	CrossLeverage []CrossLeverageRow
+	VenueTable    []VenueRow
+	CashScenario  []ScenarioRow
+	CrossScenario []ScenarioRow
+
+	Dispersion     []DispersionRow
+	DispersionPath string
+	DispersionErr  string
+
+	// Budgets is what each book is ACTUALLY enforcing, read from the ledger
+	// files the services wrote -- not from config/capital.json, which would
+	// show what the ceiling is supposed to be and hide a service running
+	// without one.
+	Budgets []BudgetView
+	// --- reverse carry, short spot / long perp, from data/reverse/ ---
+	Reverse ReverseView
+}
+
+// VenueView is one venue's fee status.
+type VenueView struct {
+	Name            string
+	RoundTripBps    float64
+	FeesVerified    bool
+	VerificationErr string
+	SourceURL       string
+	VerifiedOn      string
+	SourceNote      string
+	SpotAvailable   bool
+	IntervalHours   float64
+}
+
+// SymbolView is the most recent record for one symbol.
+type SymbolView struct {
+	Symbol        string
+	Venue         string
+	RatePct       float64
+	IntervalHours float64
+	AnnualPct     float64
+	CostBps       float64
+	NetBps7d      float64
+	NetBps30d     float64
+	BreakevenDays float64
+	Viable7d      bool
+	Viable30d     bool
+	Gate30d       string
+	SlipBps       float64
+	SpotVol       float64
+	PerpVol       float64
+	BasisBps      float64
+	AgeSec        int64
+}
+
+// GateCount is one refusal category and how many symbols are in it.
+type GateCount struct {
+	Gate  string
+	Count int
+	Label string
+}
+
+var gateLabels = map[string]string{
+	funding.GateOK:          "cleared every filter and the cost gate",
+	funding.GateNoSpot:      "no spot market - position cannot be constructed",
+	funding.GateThinPerp:    "perp volume too thin for this size",
+	funding.GateThinSpot:    "spot volume too thin - long leg cannot be bought",
+	funding.GateShallow:     "book too shallow at the touch",
+	funding.GateUnmeasured:  "book unreadable - execution cost unknown",
+	funding.GateUnverified:  "venue fees not verified",
+	funding.GateNegative:    "negative funding - the short leg pays",
+	funding.GateZero:        "funding is zero",
+	funding.GateNotCovering: "funding does not cover the round trip",
+}
+
+// Handler returns the HTTP mux.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handlePage)
+	mux.HandleFunc("/api/snapshot", s.handleAPI)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, "ok")
+	})
+	return mux
+}
+
+func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
+	snap := s.snapshot(7)
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(snap)
+}
+
+func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	snap := s.snapshot(7)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := pageTmpl.Execute(w, snap); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// snapshot reads up to maxDays of journal and aggregates.
+//
+// Memory discipline: records are streamed and only the LATEST per symbol is
+// retained, plus running aggregates. A full day is ~12 MB on disk and this
+// process runs under a 300 MB cgroup cap alongside GAMA.
+func (s *Server) snapshot(maxDays int) Snapshot {
+	snap := Snapshot{
+		GeneratedAt: time.Now().UTC(),
+		JournalDir:  s.JournalDir,
+		Uptime:      time.Since(s.StartedAt).Round(time.Second).String(),
+	}
+
+	// Before anything that can return early. A page that cannot read the
+	// journal should still be able to say what the books are holding.
+	snap.Budgets = s.budgets()
+	snap.Reverse = s.loadReverse()
+
+	for _, src := range s.Registry.Sources() {
+		v := src.Venue()
+		vv := VenueView{
+			Name:          v.Name,
+			RoundTripBps:  v.Fees.RoundTripBps(),
+			FeesVerified:  v.FeesVerified,
+			SourceURL:     v.Source.URL,
+			VerifiedOn:    v.Source.VerifiedOn,
+			SourceNote:    v.Source.Note,
+			SpotAvailable: v.SpotAvailable,
+			IntervalHours: v.DefaultFundingIntervalHours,
+		}
+		if err := v.Validate(); err != nil {
+			vv.VerificationErr = err.Error()
+		}
+		snap.Venues = append(snap.Venues, vv)
+	}
+
+	days, err := journal.Days(s.JournalDir)
+	if err != nil {
+		snap.Err = "reading journal directory: " + err.Error()
+		return snap
+	}
+	snap.Days = days
+	if b, n, err := journal.DiskUsage(s.JournalDir); err == nil {
+		snap.JournalBytes = b
+		snap.JournalFiles = n
+	}
+
+	if len(days) > maxDays {
+		days = days[len(days)-maxDays:]
+	}
+
+	latestPerSymbol := map[string]funding.Record{}
+	var nets []float64
+	var netSum float64
+
+	for _, day := range days {
+		_ = journal.ReadDay(s.JournalDir, day, func(line []byte) error {
+			var rec funding.Record
+			if err := json.Unmarshal(line, &rec); err != nil {
+				return nil // skip, do not abort ninety days for one bad line
+			}
+			switch rec.Type {
+			case "health":
+				if snap.Latest == nil || rec.TsMs > snap.Latest.TsMs {
+					cp := rec
+					snap.Latest = &cp
+				}
+			case "obs":
+				snap.TotalObs++
+				if rec.Viable7d || rec.Viable30d {
+					snap.PassingObs++
+				}
+				nets = append(nets, rec.NetBps30d)
+				netSum += rec.NetBps30d
+				key := rec.Venue + ":" + rec.Symbol
+				if prev, ok := latestPerSymbol[key]; !ok || rec.TsMs > prev.TsMs {
+					latestPerSymbol[key] = rec
+				}
+			}
+			return nil
+		})
+	}
+
+	if len(nets) > 0 {
+		sort.Float64s(nets)
+		snap.NetMin = nets[0]
+		snap.NetMax = nets[len(nets)-1]
+		snap.NetMedian = nets[len(nets)/2]
+		snap.NetMean = netSum / float64(len(nets))
+	}
+
+	now := time.Now().UTC()
+	if snap.Latest != nil {
+		snap.LatestAgeSec = int64(now.Sub(time.UnixMilli(snap.Latest.TsMs)).Seconds())
+		// Two missed polls at the 5-minute default. If this is red, the
+		// monitor is not writing and nothing else on this page is current.
+		snap.Stale = snap.LatestAgeSec > 900
+		for gate, n := range snap.Latest.Gates {
+			snap.Gates = append(snap.Gates, GateCount{Gate: gate, Count: n, Label: gateLabels[gate]})
+		}
+		sort.Slice(snap.Gates, func(i, j int) bool { return snap.Gates[i].Count > snap.Gates[j].Count })
+	}
+
+	for _, rec := range latestPerSymbol {
+		if !rec.SpotAvailable {
+			continue // unconstructable; not worth a row
+		}
+		sv := SymbolView{
+			Symbol:        rec.Symbol,
+			Venue:         rec.Venue,
+			RatePct:       rec.FundingRatePct,
+			IntervalHours: rec.IntervalHours,
+			AnnualPct:     rec.AnnualizedPct,
+			CostBps:       rec.CostBps,
+			NetBps7d:      rec.NetBps7d,
+			NetBps30d:     rec.NetBps30d,
+			BreakevenDays: rec.BreakevenDays,
+			Viable7d:      rec.Viable7d,
+			Viable30d:     rec.Viable30d,
+			Gate30d:       rec.Gate30d,
+			SlipBps:       2*rec.SpotHalfSpreadBps + 2*rec.PerpHalfSpreadBps,
+			SpotVol:       rec.SpotVol24hUSD,
+			PerpVol:       rec.PerpVol24hUSD,
+			BasisBps:      rec.BasisBps,
+			AgeSec:        int64(now.Sub(time.UnixMilli(rec.TsMs)).Seconds()),
+		}
+		if rec.Gate30d == funding.GateOK || rec.Gate7d == funding.GateOK {
+			snap.Passed = append(snap.Passed, sv)
+		} else {
+			snap.Refused = append(snap.Refused, sv)
+		}
+	}
+	sort.Slice(snap.Passed, func(i, j int) bool {
+		return snap.Passed[i].NetBps30d > snap.Passed[j].NetBps30d
+	})
+	sort.Slice(snap.Refused, func(i, j int) bool {
+		return snap.Refused[i].NetBps30d > snap.Refused[j].NetBps30d
+	})
+	if len(snap.Refused) > 25 {
+		snap.Refused = snap.Refused[:25]
+	}
+
+	s.enrich(&snap)
+
+	return snap
+}
+
+func fmtUSD(v float64) string {
+	switch {
+	case v >= 1e9:
+		return fmt.Sprintf("$%.1fbn", v/1e9)
+	case v >= 1e6:
+		return fmt.Sprintf("$%.0fm", v/1e6)
+	case v >= 1e3:
+		return fmt.Sprintf("$%.0fk", v/1e3)
+	default:
+		return fmt.Sprintf("$%.0f", v)
+	}
+}
+
+func fmtBytes(b int64) string {
+	switch {
+	case b >= 1<<30:
+		return fmt.Sprintf("%.2f GB", float64(b)/(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(b)/(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.1f KB", float64(b)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
+}
+
+func fmtAge(sec int64) string {
+	d := time.Duration(sec) * time.Second
+	return d.Round(time.Second).String()
+}
+
+var pageTmpl = template.Must(template.New("page").Funcs(template.FuncMap{
+	"usd":   fmtUSD,
+	"bytes": fmtBytes,
+	"age":   fmtAge,
+}).Parse(pageHTML))
+
+const pageHTML = `<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="30">
+<title>VEGA - funding measurement</title>
+<style>
+:root { color-scheme: dark; }
+body { background:#0e1116; color:#c9d1d9; font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; margin:0; padding:24px; }
+h1 { font-size:18px; margin:0 0 4px; color:#e6edf3; }
+h2 { font-size:13px; margin:28px 0 8px; color:#8b949e; text-transform:uppercase; letter-spacing:.08em; }
+.sub { color:#8b949e; margin-bottom:20px; }
+.banner { padding:10px 14px; border-radius:6px; margin-bottom:18px; }
+.paper { background:#1c2128; border:1px solid #30363d; color:#8b949e; }
+.stale { background:#3d1d1d; border:1px solid #6e2020; color:#ffa198; }
+.cards { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:8px; }
+.card { background:#161b22; border:1px solid #30363d; border-radius:6px; padding:12px 16px; min-width:130px; }
+.card .k { color:#8b949e; font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+.card .v { font-size:20px; color:#e6edf3; margin-top:2px; }
+table { border-collapse:collapse; width:100%; margin-top:4px; }
+th { text-align:left; color:#8b949e; font-weight:normal; border-bottom:1px solid #30363d; padding:6px 10px 6px 0; font-size:11px; text-transform:uppercase; letter-spacing:.05em; }
+td { padding:5px 10px 5px 0; border-bottom:1px solid #1c2128; white-space:nowrap; }
+.pos { color:#3fb950; } .neg { color:#f85149; } .dim { color:#6e7681; }
+.ok { color:#3fb950; font-weight:600; } .no { color:#8b949e; }
+.warn { color:#d29922; }
+.note { color:#6e7681; margin-top:10px; max-width:900px; white-space:normal; }
+a { color:#58a6ff; }
+</style></head><body>
+
+<h1>VEGA -- funding rate measurement</h1>
+<div class="sub">{{.GeneratedAt.Format "2006-01-02 15:04:05"}} UTC · journal {{.JournalDir}} · page uptime {{.Uptime}}</div>
+
+<div class="banner paper">
+PAPER MEASUREMENT ONLY. No order placement code exists in this system. Every figure below is
+what a fully-costed position <em>would</em> have earned: four fee legs plus slippage measured
+from the live book on both sides.
+</div>
+
+{{if .Stale}}
+<div class="banner stale">
+STALE -- the most recent poll was {{age .LatestAgeSec}} ago. The monitor may have stopped.
+Check <code>vega logs</code> and <code>systemctl status vega</code>.
+</div>
+{{end}}
+
+{{if .Err}}<div class="banner stale">{{.Err}}</div>{{end}}
+
+<div class="cards">
+  <div class="card"><div class="k">cash-and-carry NET $</div>
+    <div class="v {{if ge .Ledger.NetUSD 0.0}}pos{{else}}neg{{end}}">{{printf "%+.2f" .Ledger.NetUSD}}</div></div>
+  <div class="card"><div class="k">cross-venue NET $</div>
+    <div class="v {{if ge .CrossLedger.NetUSD 0.0}}pos{{else}}neg{{end}}">{{printf "%+.2f" .CrossLedger.NetUSD}}</div></div>
+  <div class="card"><div class="k">cash-and-carry capital $</div>
+    <div class="v">{{printf "%.0f" .Ledger.CapitalUSD}}</div></div>
+  <div class="card"><div class="k">cross-venue capital $</div>
+    <div class="v">{{printf "%.0f" .CrossLedger.CapitalUSD}}</div></div>
+</div>
+<div class="note">
+Every heading below states its unit. <b>$</b> is US dollars, <b>bps</b> is basis
+points (100 bps = 1%), <b>%/yr</b> is percent per year, <b>h</b> and <b>d</b> are
+hours and days. A number whose unit has to be guessed is how this project spent a
+day reading a 4-hour funding rate as an 8-hour one.
+</div>
+
+<h2 style="border-top:2px solid #444;padding-top:14px;margin-top:34px">1 &nbsp; CASH-AND-CARRY &mdash; long spot, short perp, one venue</h2>
+<div class="note">The safe book. Capital is 2 x notional because the spot must be owned outright. Measured return is low single digits a year unlevered.</div>
+
+<h2>Capital &amp; P&amp;L &mdash; paper book</h2>
+{{if .Ledger.Err}}
+<div class="banner stale">{{.Ledger.Err}}</div>
+{{else if not .Ledger.Available}}
+<div class="note">No paper book yet.</div>
+{{else}}
+<div class="cards">
+  <div class="card"><div class="k">notional / leg</div><div class="v">{{usd .Ledger.NotionalUSD}}</div></div>
+  <div class="card"><div class="k">capital deployed</div><div class="v">{{usd .Ledger.CapitalUSD}}</div></div>
+{{range .Budgets}}  <div class="card"><div class="k">budget &middot; {{.Name}}{{if .Note}} <span style="color:#b45309">({{.Note}})</span>{{end}}</div><div class="v">{{if .Active}}{{usd .Allocated}} / {{usd .Principal}}{{else}}&mdash;{{end}}</div></div>
+{{end}}  <div class="card"><div class="k">net</div><div class="v {{if lt .Ledger.NetUSD 0.0}}neg{{else}}pos{{end}}">{{printf "%+.2f" .Ledger.NetUSD}}</div></div>
+  <div class="card"><div class="k">return on capital</div><div class="v {{if lt .Ledger.ReturnPct 0.0}}neg{{else}}pos{{end}}">{{printf "%+.3f" .Ledger.ReturnPct}}%</div></div>
+  <div class="card"><div class="k">open</div><div class="v">{{.Ledger.OpenCount}}</div></div>
+  <div class="card"><div class="k">closed</div><div class="v">{{.Ledger.ClosedCount}}</div></div>
+</div>
+<table>
+<tr><th>funding collected</th><th>entry costs</th><th>exit costs</th><th>= NET</th>
+    <th>realised</th><th>unrealised</th><th>avg round trip</th><th>avg held</th></tr>
+<tr>
+  <td class="{{if lt .Ledger.FundingUSD 0.0}}neg{{else}}pos{{end}}">{{printf "%+.4f" .Ledger.FundingUSD}}</td>
+  <td class="neg">{{printf "%+.4f" .Ledger.EntryUSD}}</td>
+  <td class="neg">{{printf "%+.4f" .Ledger.ExitUSD}}</td>
+  <td class="{{if lt .Ledger.NetUSD 0.0}}neg{{else}}pos{{end}}"><b>{{printf "%+.4f" .Ledger.NetUSD}}</b></td>
+  <td class="{{if lt .Ledger.RealizedUSD 0.0}}neg{{else}}pos{{end}}">{{printf "%+.4f" .Ledger.RealizedUSD}}</td>
+  <td class="{{if lt .Ledger.UnrealizedUSD 0.0}}neg{{else}}pos{{end}}">{{printf "%+.4f" .Ledger.UnrealizedUSD}}</td>
+  <td>{{printf "%.2f" .Ledger.MeanRoundTripBps}} bps</td>
+  <td>{{printf "%.2f" .Ledger.MeanHoldDays}} d</td>
+</tr>
+</table>
+<div class="note" style="margin-top:8px">
+The first three columns add to the fourth. Exit costs on OPEN positions are estimated as
+symmetric with entry and have not been paid yet &mdash; they are carried because a position
+is not profitable until it has covered the cost of getting out as well as in.
+</div>
+{{end}}
+
+<h2>Open positions</h2>
+{{if .OpenPositions}}
+<table>
+<tr><th>symbol</th><th>venue</th><th>opened</th><th>held</th><th>entry rate</th><th>rate now</th>
+    <th>funding bps</th><th>funding $</th><th>entry cost</th><th>exit cost</th>
+    <th>net bps</th><th>net $</th><th>on capital</th><th>break-even</th><th>settled</th><th>neg</th></tr>
+{{range .OpenPositions}}
+<tr>
+  <td><span class="ok">{{.Symbol}}</span></td>
+  <td class="dim">{{.Venue}}</td>
+  <td class="dim">{{.OpenedAt}}</td>
+  <td>{{printf "%.2f" .HeldDays}}d</td>
+  <td>{{printf "%+.4f" .EntryRatePct}}%</td>
+  <td>{{printf "%+.4f" .LastRatePct}}%</td>
+  <td class="{{if lt .FundingBps 0.0}}neg{{else}}pos{{end}}">{{printf "%+.3f" .FundingBps}}</td>
+  <td class="{{if lt .FundingUSD 0.0}}neg{{else}}pos{{end}}">{{printf "%+.4f" .FundingUSD}}</td>
+  <td>{{printf "%.2f" .EntryCostBps}}</td>
+  <td>{{printf "%.2f" .ExitCostBps}}{{if .ExitIsEstimate}}<span class="dim"> est</span>{{end}}</td>
+  <td class="{{if lt .NetBps 0.0}}neg{{else}}pos{{end}}">{{printf "%+.2f" .NetBps}}</td>
+  <td class="{{if lt .NetUSD 0.0}}neg{{else}}pos{{end}}">{{printf "%+.4f" .NetUSD}}</td>
+  <td class="{{if lt .ReturnPct 0.0}}neg{{else}}pos{{end}}">{{printf "%+.3f" .ReturnPct}}%</td>
+  <td>{{if gt .BreakEvenDays 0.0}}{{printf "%.1f" .BreakEvenDays}}d{{else}}<span class="dim">-</span>{{end}}</td>
+  <td>{{.Intervals}}</td>
+  <td class="{{if gt .Negatives 0}}neg{{else}}dim{{end}}">{{.Negatives}}</td>
+</tr>
+{{end}}
+</table>
+<div class="note" style="margin-top:8px">
+Sorted WORST FIRST. A book is exactly as good as its weakest position, and the
+<b>neg</b> column is the early sign of a funding regime turning against you.
+</div>
+{{else}}
+<div class="note">No open positions.</div>
+{{end}}
+
+<h2>Closed positions</h2>
+{{if .ClosedPositions}}
+<table>
+<tr><th>symbol</th><th>venue</th><th>opened</th><th>closed</th><th>held</th>
+    <th>funding bps</th><th>funding $</th><th>entry</th><th>exit</th>
+    <th>net bps</th><th>net $</th><th>on capital</th><th>why it closed</th></tr>
+{{range .ClosedPositions}}
+<tr>
+  <td>{{.Symbol}}</td>
+  <td class="dim">{{.Venue}}</td>
+  <td class="dim">{{.OpenedAt}}</td>
+  <td class="dim">{{.ClosedAt}}</td>
+  <td>{{printf "%.2f" .HeldDays}}d</td>
+  <td class="{{if lt .FundingBps 0.0}}neg{{else}}pos{{end}}">{{printf "%+.3f" .FundingBps}}</td>
+  <td class="{{if lt .FundingUSD 0.0}}neg{{else}}pos{{end}}">{{printf "%+.4f" .FundingUSD}}</td>
+  <td>{{printf "%.2f" .EntryCostBps}}</td>
+  <td>{{printf "%.2f" .ExitCostBps}}</td>
+  <td class="{{if lt .NetBps 0.0}}neg{{else}}pos{{end}}">{{printf "%+.2f" .NetBps}}</td>
+  <td class="{{if lt .NetUSD 0.0}}neg{{else}}pos{{end}}">{{printf "%+.4f" .NetUSD}}</td>
+  <td class="{{if lt .ReturnPct 0.0}}neg{{else}}pos{{end}}">{{printf "%+.3f" .ReturnPct}}%</td>
+  <td class="dim">{{.Reason}}</td>
+</tr>
+{{end}}
+</table>
+{{else}}
+<div class="note">Nothing has closed yet, so there is no realised result to read.</div>
+{{end}}
+
+
+<h2>Scenario &mdash; the WHOLE cash-and-carry book at each leverage</h2>
+{{if .CashScenario}}
+<div class="note">
+What this book would have earned had it run levered since day one, on the SAME
+capital. Spot must be OWNED, so scaling means BORROWING USDT at
+{{printf "%.3f" .BorrowUSDTPct}}%/yr &mdash; every turn pays interest.
+A row marked <b>!</b> earns LESS than unlevered.
+</div>
+<table>
+<tr><th>leverage</th><th>notional $</th><th>your capital $</th><th>borrowed $</th>
+    <th>funding $</th><th>borrow cost $</th><th>net $</th><th>return % (period)</th><th>return %/yr</th></tr>
+{{range .CashScenario}}
+<tr>
+  <td><b>{{printf "%.0fx" .Leverage}}</b></td>
+  <td>{{printf "%.0f" .NotionalUSD}}</td>
+  <td>{{printf "%.0f" .CapitalUSD}}</td>
+  <td>{{printf "%.0f" .BorrowedUSD}}</td>
+  <td class="{{if ge .FundingUSD 0.0}}pos{{else}}neg{{end}}">{{printf "%+.2f" .FundingUSD}}</td>
+  <td class="neg">{{printf "%+.2f" .BorrowUSD}}</td>
+  <td class="{{if ge .NetUSD 0.0}}pos{{else}}neg{{end}}"><b>{{printf "%+.2f" .NetUSD}}</b></td>
+  <td class="{{if ge .ReturnPct 0.0}}pos{{else}}neg{{end}}">{{printf "%+.3f" .ReturnPct}}</td>
+  <td class="{{if ge .AnnualPct 0.0}}pos{{else}}neg{{end}}">{{printf "%+.1f" .AnnualPct}}{{if .Worse}} !{{end}}</td>
+</tr>
+{{end}}
+</table>
+{{else}}<div class="note">No positions to model.</div>{{end}}
+<h2>Leverage &mdash; cash-and-carry (borrowed spot)</h2>
+{{if .Leverage}}
+<div class="note">
+You must OWN the spot, so scaling means BORROWING, and every turn pays interest:
+<b>return = f x L &minus; b x (L&minus;1)</b>, where f is net funding and b is the
+borrow rate ({{printf "%.3f" .BorrowUSDTPct}}%/yr USDT). A row marked <b>!</b> earns
+LESS levered than unlevered &mdash; the borrow costs more than the edge is worth.
+</div>
+<table>
+<tr><th>symbol</th><th>venue</th><th>funding %/yr</th><th>cost %/yr</th><th>NET f %/yr</th>
+    <th>1x %/yr</th><th>3x %/yr</th><th>5x %/yr</th><th>10x %/yr</th></tr>
+{{range .Leverage}}
+<tr>
+  <td><b>{{.Symbol}}</b></td><td>{{.Venue}}</td>
+  <td class="pos">{{printf "%.2f" .FundingPctYr}}</td>
+  <td class="neg">{{printf "%.2f" .CostPctYr}}</td>
+  <td class="{{if ge .NetPctYr 0.0}}pos{{else}}neg{{end}}"><b>{{printf "%+.2f" .NetPctYr}}</b></td>
+  <td class="{{if ge .At1x 0.0}}pos{{else}}neg{{end}}">{{printf "%+.1f" .At1x}}</td>
+  <td class="{{if ge .At3x 0.0}}pos{{else}}neg{{end}}">{{printf "%+.1f" .At3x}}{{if .Worse}} !{{end}}</td>
+  <td class="{{if ge .At5x 0.0}}pos{{else}}neg{{end}}">{{printf "%+.1f" .At5x}}{{if .Worse}} !{{end}}</td>
+  <td class="{{if ge .At10x 0.0}}pos{{else}}neg{{end}}">{{printf "%+.1f" .At10x}}{{if .Worse}} !{{end}}</td>
+</tr>
+{{end}}
+</table>
+{{else}}<div class="note">No open positions to model.</div>{{end}}
+
+<h2>Passed &mdash; tradeable at this size after every cost</h2>
+{{if .Passed}}
+<table>
+<tr><th>symbol</th><th>venue</th><th>rate/int</th><th>int</th><th>annual/notional</th><th>cost</th>
+    <th>net 7d</th><th>net 30d</th><th>break-even</th><th>slip</th><th>spot vol</th><th>basis</th><th>age</th></tr>
+{{range .Passed}}
+<tr>
+  <td><span class="ok">{{.Symbol}}</span></td><td>{{.Venue}}</td>
+  <td>{{printf "%+.4f" .RatePct}}%</td>
+  <td>{{printf "%.0f" .IntervalHours}}h</td>
+  <td>{{printf "%.2f" .AnnualPct}}%</td>
+  <td>{{printf "%.2f" .CostBps}}</td>
+  <td class="{{if gt .NetBps7d 0.0}}pos{{else}}neg{{end}}">{{printf "%+.2f" .NetBps7d}}</td>
+  <td class="{{if gt .NetBps30d 0.0}}pos{{else}}neg{{end}}">{{printf "%+.2f" .NetBps30d}}</td>
+  <td>{{if lt .BreakevenDays 0.0}}never{{else}}{{printf "%.1f" .BreakevenDays}}d{{end}}</td>
+  <td>{{printf "%.2f" .SlipBps}}</td>
+  <td>{{usd .SpotVol}}</td>
+  <td>{{printf "%+.1f" .BasisBps}}</td>
+  <td class="dim">{{age .AgeSec}}</td>
+</tr>
+{{end}}
+</table>
+{{else}}
+<div class="note">Nothing is tradeable at this size right now. That is a finding, not a
+failure: the current funding regime does not pay for a round trip on any symbol
+liquid enough to enter. The table below shows what was rejected and why.</div>
+{{end}}
+
+<h2>Why symbols were refused (latest poll)</h2>
+<table>
+<tr><th>count</th><th>gate</th><th>meaning</th></tr>
+{{range .Gates}}
+<tr><td>{{.Count}}</td><td>{{.Gate}}</td><td class="dim">{{.Label}}</td></tr>
+{{end}}
+</table>
+
+<h2>Refused &mdash; high raw numbers that cannot be captured</h2>
+<div class="note" style="margin-bottom:8px">
+These net figures are what the position WOULD have earned if it could be built and filled.
+It cannot. They rank highest precisely because they are illiquid: the funding is payment for
+a risk, and the gate column says which one. Do not read this as a ranking of opportunity.
+</div>
+<table>
+<tr><th>symbol</th><th>venue</th><th>rate/int</th><th>int</th><th>annual/notional</th><th>cost</th>
+    <th>net 7d</th><th>net 30d</th><th>break-even</th><th>slip</th><th>spot vol</th><th>basis</th><th>gate</th><th>age</th></tr>
+{{range .Refused}}
+<tr>
+  <td>{{if .Viable30d}}<span class="ok">{{.Symbol}}</span>{{else}}{{.Symbol}}{{end}}</td>
+  <td>{{.Venue}}</td>
+  <td>{{printf "%+.4f" .RatePct}}%</td>
+  <td>{{printf "%.0f" .IntervalHours}}h</td>
+  <td>{{printf "%.2f" .AnnualPct}}%</td>
+  <td>{{printf "%.2f" .CostBps}}</td>
+  <td class="{{if gt .NetBps7d 0.0}}pos{{else}}neg{{end}}">{{printf "%+.2f" .NetBps7d}}</td>
+  <td class="{{if gt .NetBps30d 0.0}}pos{{else}}neg{{end}}">{{printf "%+.2f" .NetBps30d}}</td>
+  <td>{{if lt .BreakevenDays 0.0}}never{{else}}{{printf "%.1f" .BreakevenDays}}d{{end}}</td>
+  <td>{{printf "%.2f" .SlipBps}}</td>
+  <td>{{usd .SpotVol}}</td>
+  <td>{{printf "%+.1f" .BasisBps}}</td>
+  <td class="dim">{{.Gate30d}}</td>
+  <td class="dim">{{age .AgeSec}}</td>
+</tr>
+{{end}}
+</table>
+
+<h2 style="border-top:2px solid #444;padding-top:14px;margin-top:34px">2 &nbsp; CROSS-VENUE &mdash; perp vs perp, two venues</h2>
+<div class="note">The scalable book. No spot leg, so both sides run on margin and leverage needs no borrowing. Higher return when a dislocation exists, and far rarer &mdash; neither venue can see the other leg, which is where the liquidation risk lives.</div>
+
+<h2>Cross-venue positions &mdash; perp vs perp</h2>
+{{if .CrossLedger.Err}}<div class="banner stale">{{.CrossLedger.Err}}</div>{{end}}
+{{if .CrossLedger.Available}}
+<table>
+<tr><td>Open / closed</td><td><b>{{.CrossLedger.OpenCount}}</b> / {{.CrossLedger.ClosedCount}}</td>
+    <td>Capital deployed</td><td><b>${{printf "%.0f" .CrossLedger.CapitalUSD}}</b></td></tr>
+{{range .Budgets}}  <tr><td>Budget &middot; {{.Name}}</td><td>{{if .Active}}<b>${{printf "%.0f" .Allocated}}</b> of ${{printf "%.0f" .Principal}} &nbsp;&middot;&nbsp; free ${{printf "%.0f" .Free}} &nbsp;&middot;&nbsp; {{.Positions}} held &nbsp;&middot;&nbsp; {{printf "%.0f" .UsedPct}}% used{{if .Note}} &nbsp;<span style="color:#b45309">{{.Note}}</span>{{end}}{{else}}<span style="color:#6b7280">{{.Note}}</span>{{end}}</td></tr>
+{{end}}<tr><td>{{if lt .CrossLedger.FundingUSD 0.0}}Funding PAID OUT{{else}}Funding collected{{end}}</td><td class="{{if gt .CrossLedger.FundingUSD 0.0}}pos{{else}}neg{{end}}">${{printf "%+.2f" .CrossLedger.FundingUSD}}</td>
+    <td>Costs</td><td class="neg">${{printf "%+.2f" .CrossLedger.CostUSD}}</td></tr>
+<tr><td>Basis, closed only</td><td class="{{if ge .CrossLedger.BasisUSD 0.0}}pos{{else}}neg{{end}}">${{printf "%+.2f" .CrossLedger.BasisUSD}}</td>
+    <td></td><td></td></tr>
+<tr><td><b>NET</b></td><td class="{{if ge .CrossLedger.NetUSD 0.0}}pos{{else}}neg{{end}}"><b>${{printf "%+.2f" .CrossLedger.NetUSD}}</b></td>
+    <td>Return on capital</td><td class="{{if ge .CrossLedger.ReturnPct 0.0}}pos{{else}}neg{{end}}">{{printf "%+.3f" .CrossLedger.ReturnPct}}%</td></tr>
+</table>
+{{end}}
+
+{{if .CrossOpen}}
+<table>
+<tr><th>PAIR</th><th>SIZE</th><th>HELD</th><th>SPREAD BPS/HR</th><th>FUNDING BPS</th>
+    <th>SETTLED L/S</th><th>COST BPS</th><th>NET BPS</th><th>NET $</th>
+    <th>BASIS ENTRY</th><th>BASIS NOW</th><th>BASIS DRIFT</th><th>BREAK-EVEN</th></tr>
+{{range .CrossOpen}}
+<tr>
+  <td><b>{{.Pair}}</b></td>
+  <td>${{printf "%.0f" .NotionalUSD}}</td>
+  <td>{{printf "%.2f" .HeldHrs}} h</td>
+  <td class="{{if gt .SpreadBpsHr 0.0}}pos{{else}}neg{{end}}">{{printf "%+.4f" .SpreadBpsHr}}</td>
+  <td class="{{if ge .FundingBps 0.0}}pos{{else}}neg{{end}}">{{printf "%+.2f" .FundingBps}}</td>
+  <td>{{.LongSettles}} / {{.ShortSettles}}</td>
+  <td>{{printf "%.2f" .RoundTripBps}}{{if not .ExitMeasured}} est{{end}}</td>
+  <td class="{{if ge .NetBps 0.0}}pos{{else}}neg{{end}}"><b>{{printf "%+.2f" .NetBps}}</b></td>
+  <td class="{{if ge .NetUSD 0.0}}pos{{else}}neg{{end}}">{{printf "%+.2f" .NetUSD}}</td>
+  <td>{{if .BasisOk}}{{printf "%+.1f" .EntryBasisBps}}{{else}}n/a{{end}}</td>
+  <td>{{if .BasisOk}}{{printf "%+.1f" .BasisBps}}{{else}}n/a{{end}}</td>
+  <td class="{{if ge .BasisDriftBps 0.0}}pos{{else}}neg{{end}}">{{if .BasisOk}}{{printf "%+.1f" .BasisDriftBps}}{{else}}n/a{{end}}</td>
+  <td class="{{if .PastBE}}pos{{else}}neg{{end}}">{{if .BreakEvenOk}}{{printf "%.1f" .BreakEvenHrs}} h{{else}}UNREACHABLE{{end}}</td>
+</tr>
+{{end}}
+</table>
+<div class="note">
+BASIS DRIFT is the PRICE result and is deliberately NOT added into NET. Funding is
+settled and banked; basis is unrealised and reverses. A single number combining
+them lets a real funding loss hide behind a paper price gain, which is how the four
+bots before this one reported profits they did not have.
+BREAK-EVEN turns green once collected funding has covered the full round trip.
+</div>
+{{else}}
+<div class="note">No cross-venue positions open. cmd/cross writes cross_positions.json.</div>
+{{end}}
+
+{{if .CrossClosed}}
+<h2>Cross-venue closed</h2>
+<table>
+<tr><th>PAIR</th><th>OPENED</th><th>CLOSED</th><th>HELD</th><th>FUNDING BPS</th>
+    <th>COST BPS</th><th>NET BPS</th><th>NET $</th><th>BASIS DRIFT</th><th>WHY</th></tr>
+{{range .CrossClosed}}
+<tr>
+  <td><b>{{.Pair}}</b></td><td>{{.OpenedAt}}</td><td>{{.ClosedAt}}</td>
+  <td>{{printf "%.2f" .HeldHrs}} h</td>
+  <td class="{{if ge .FundingBps 0.0}}pos{{else}}neg{{end}}">{{printf "%+.2f" .FundingBps}}</td>
+  <td>{{printf "%.2f" .RoundTripBps}}</td>
+  <td class="{{if ge .NetBps 0.0}}pos{{else}}neg{{end}}"><b>{{printf "%+.2f" .NetBps}}</b></td>
+  <td class="{{if ge .NetUSD 0.0}}pos{{else}}neg{{end}}">{{printf "%+.2f" .NetUSD}}</td>
+  <td>{{if .BasisOk}}{{printf "%+.1f" .BasisDriftBps}}{{else}}n/a{{end}}</td>
+  <td>{{.Reason}}</td>
+</tr>
+{{end}}
+</table>
+{{end}}
+
+<h2>Live candidates &mdash; every venue pair assessed this pass</h2>
+{{if .Candidates}}
+<div class="note">
+The latest scan across <b>all four venues</b>, including OKX. Earlier passes are
+history, not state, so only this one is shown. <b>ivl</b> is each leg's funding
+interval in hours &mdash; measured from the venue, never assumed.
+Assessed {{.CandidatesAt.Format "2006-01-02 15:04"}} UTC.
+</div>
+<table>
+<tr><th>coin</th><th>long venue</th><th>short venue</th><th>ivl h</th>
+    <th>spread bps/hr</th><th>spread %/day</th><th>cost bps</th><th>break-even h</th>
+    <th>size $</th><th>basis bps</th><th>verdict</th></tr>
+{{range .Candidates}}
+<tr>
+  <td><b>{{.Coin}}</b></td><td>{{.LongVenue}}</td><td>{{.ShortVenue}}</td>
+  <td>{{printf "%.0f" .LongIntervalHours}}/{{printf "%.0f" .ShortIntervalHours}}{{if not .IntervalsExplicit}}*{{end}}</td>
+  <td class="{{if gt .SpreadBpsHr 0.0}}pos{{else}}neg{{end}}">{{printf "%+.4f" .SpreadBpsHr}}</td>
+  <td class="{{if gt .SpreadPctDay 0.0}}pos{{else}}neg{{end}}">{{printf "%+.3f" .SpreadPctDay}}</td>
+  <td>{{printf "%.1f" .CostBps}}</td>
+  <td>{{if gt .BreakEvenHrs 0.0}}{{printf "%.1f" .BreakEvenHrs}}{{else}}&mdash;{{end}}</td>
+  <td>{{if gt .NotionalUSD 0.0}}{{printf "%.0f" .NotionalUSD}}{{else}}&mdash;{{end}}</td>
+  <td>{{if .BasisOk}}{{printf "%+.1f" .BasisBps}}{{else}}n/a{{end}}</td>
+  <td class="{{if .Viable}}pos{{else}}dim{{end}}">{{if .Viable}}OK{{else}}{{.Gate}}{{end}}</td>
+</tr>
+{{end}}
+</table>
+<div class="note">
+A verdict other than OK is a REFUSAL and the reason is named. The commonest are
+BELOW_EXCHANGE_MINIMUM (the book cannot fill the smallest allowed order) and
+STOPS_OUT_BEFORE_PROFIT (the simulated settlement path breaches the stop loss
+before it breaks even). * marks an interval taken from a venue default rather
+than published for that symbol.
+</div>
+{{else}}<div class="note">No candidate data yet. cmd/cross writes crossvenue/passes.jsonl.</div>{{end}}
+
+
+<h2>Scenario &mdash; the WHOLE cross-venue book at each leverage</h2>
+{{if .CrossScenario}}
+<div class="note">
+NOTHING IS BORROWED. Both legs are perps posted on margin, so the same notional
+needs less capital as leverage rises and the return scales cleanly. There is no
+interest column because there is no interest.
+<br><br>
+<b>But this table does not model liquidation.</b> Replayed against real
+1-minute marks, cross-venue positions died 0% of the time at 3x, <b>33% at 5x</b>
+and <b>69% at 10x</b>. The 5x and 10x rows below are what you would have earned
+IF NOTHING WAS LIQUIDATED, and a third of them would have been. Read the 3x row.
+</div>
+<table>
+<tr><th>leverage</th><th>notional $</th><th>capital needed $</th><th>net $</th>
+    <th>return % (period)</th><th>return %/yr</th><th>liquidation risk</th></tr>
+{{range .CrossScenario}}
+<tr>
+  <td><b>{{printf "%.0fx" .Leverage}}</b></td>
+  <td>{{printf "%.0f" .NotionalUSD}}</td>
+  <td>{{printf "%.0f" .CapitalUSD}}</td>
+  <td class="{{if ge .NetUSD 0.0}}pos{{else}}neg{{end}}"><b>{{printf "%+.2f" .NetUSD}}</b></td>
+  <td class="{{if ge .ReturnPct 0.0}}pos{{else}}neg{{end}}">{{printf "%+.3f" .ReturnPct}}</td>
+  <td class="{{if ge .AnnualPct 0.0}}pos{{else}}neg{{end}}">{{printf "%+.1f" .AnnualPct}}</td>
+  <td class="{{if gt .Leverage 3.0}}neg{{else}}pos{{end}}">
+    {{if gt .Leverage 5.0}}69% died{{else if gt .Leverage 3.0}}33% died{{else}}0% died{{end}}</td>
+</tr>
+{{end}}
+</table>
+{{else}}<div class="note">No cross-venue positions to model.</div>{{end}}
+<h2>Leverage &mdash; cross-venue (no borrowing)</h2>
+{{if .CrossLeverage}}
+<div class="note">
+Both legs are perps posted on margin, so there is NOTHING TO BORROW. Capital is
+2 x notional at 1x and 2 x notional / L above it, so
+<b>return = base x L</b> &mdash; linear, with no interest drag. That is the
+structural advantage over cash-and-carry. The cost is liquidation: replayed
+against real 1-minute marks, cross-venue positions died 0% of the time at 3x,
+33% at 5x and 69% at 10x, because neither venue can see the other leg.
+</div>
+<table>
+<tr><th>pair</th><th>state</th><th>held d</th><th>net bps</th><th>net $</th>
+    <th>on notional %/yr</th><th>1x %/yr</th><th>3x %/yr</th><th>5x %/yr</th></tr>
+{{range .CrossLeverage}}
+<tr>
+  <td><b>{{.Pair}}</b></td><td class="dim">{{.State}}</td>
+  <td>{{printf "%.2f" .HeldDays}}</td>
+  <td class="{{if ge .NetBps 0.0}}pos{{else}}neg{{end}}">{{printf "%+.2f" .NetBps}}</td>
+  <td class="{{if ge .NetUSD 0.0}}pos{{else}}neg{{end}}">{{printf "%+.2f" .NetUSD}}</td>
+  {{if .TooShort}}
+  <td colspan="4" class="dim">held under a day &mdash; annualising it would describe division, not performance</td>
+  {{else}}
+  <td class="{{if ge .AnnualPct 0.0}}pos{{else}}neg{{end}}">{{printf "%+.1f" .AnnualPct}}</td>
+  <td class="{{if ge .At1x 0.0}}pos{{else}}neg{{end}}">{{printf "%+.1f" .At1x}}</td>
+  <td class="{{if ge .At3x 0.0}}pos{{else}}neg{{end}}">{{printf "%+.1f" .At3x}}</td>
+  <td class="{{if ge .At5x 0.0}}pos{{else}}neg{{end}}">{{printf "%+.1f" .At5x}}</td>
+  {{end}}
+</tr>
+{{end}}
+</table>
+{{else}}<div class="note">No cross-venue positions to model.</div>{{end}}
+
+<h2 style="border-top:2px solid #444;padding-top:14px;margin-top:34px">3 &nbsp; REFERENCE</h2>
+<div class="note">Fees, funding intervals and borrow costs behind every number above.</div>
+
+<h2>Venues &mdash; fees, intervals, borrow</h2>
+<table>
+<tr><th>venue</th><th>role</th><th>perp taker bps</th><th>spot taker bps</th>
+    <th>fees</th><th>funding interval</th><th>USDT borrow %/yr</th><th>note</th></tr>
+{{range .VenueTable}}
+<tr>
+  <td><b>{{.Name}}</b></td>
+  <td>{{.Role}}</td>
+  <td>{{printf "%.1f" .PerpTakerBps}}</td>
+  <td>{{if gt .SpotTakerBps 0.0}}{{printf "%.1f" .SpotTakerBps}}{{else}}&mdash;{{end}}</td>
+  <td class="{{if .FeesVerified}}pos{{else}}neg{{end}}">{{if .FeesVerified}}VERIFIED{{else}}NOT VERIFIED{{end}}</td>
+  <td class="dim">{{.IntervalNote}}</td>
+  <td>{{if .HasBorrow}}{{printf "%.3f" .BorrowAnnual}}{{else}}&mdash;{{end}}</td>
+  <td class="dim">{{.Note}}</td>
+</tr>
+{{end}}
+</table>
+<div class="note">
+<b>Lighter quotes its funding rate per 8 HOURS and settles it every HOUR.</b>
+Those are different numbers and mixing them is an 8x error &mdash; reading the
+quote as hourly showed KAITO at +13.465 bps/hr when the true figure was +1.366.
+Every other venue on this list quotes and settles over the same period.
+<br><br>
+Fee sources, each read on the date shown. Only Lighter's comes from an API;
+no other venue publishes a taker fee on an unauthenticated endpoint:
+{{range .VenueTable}}<br>&nbsp;&nbsp;<b>{{.Name}}</b>: {{.FeeSource}}{{end}}
+</div>
+
+<h2>Borrow rates &mdash; what leverage costs</h2>
+{{if .Borrow}}
+<div class="note">
+Leverage on cash-and-carry multiplies (funding &minus; borrow), not funding. Bybit
+publishes an HOURLY rate and OKX a DAILY one; both are normalised here, because
+the same figure means 24 different things depending on which venue sent it.
+Read {{.BorrowAt.Format "2026-01-02 15:04"}} UTC.
+</div>
+<table>
+<tr><th>venue</th><th>currency</th><th>annual %/yr</th><th>hourly %</th>
+    <th>max borrow $</th><th>borrowable</th></tr>
+{{range .Borrow}}
+<tr>
+  <td><b>{{.Venue}}</b></td><td>{{.Currency}}</td>
+  <td class="{{if .Cheapest}}pos{{end}}"><b>{{printf "%.3f" .AnnualPct}}</b>{{if .Cheapest}} cheapest{{end}}</td>
+  <td class="dim">{{printf "%.6f" .HourlyPct}}</td>
+  <td>{{printf "%.0f" .MaxBorrowUSD}}</td>
+  <td class="{{if .Borrowable}}pos{{else}}neg{{end}}">{{if .Borrowable}}yes{{else}}no{{end}}</td>
+</tr>
+{{end}}
+</table>
+{{else}}<div class="note">No borrow readings yet. The hourly timer writes borrow/rates.jsonl.</div>{{end}}
+
+<h2 style="border-top:2px solid #444;padding-top:14px;margin-top:34px">4 &nbsp; DIAGNOSTICS</h2>
+<div class="note">Check these when something looks wrong, not every time.</div>
+
+<h2>Current poll</h2>
+<div class="cards">
+{{with .Latest}}
+  <div class="card"><div class="k">observed</div><div class="v">{{.Observed}}</div></div>
+  <div class="card"><div class="k">hedgeable</div><div class="v">{{.Hedgeable}}</div></div>
+  <div class="card"><div class="k">passing</div><div class="v">{{.Passing}}</div></div>
+  <div class="card"><div class="k">neg funding</div><div class="v">{{.NegativeRate}}</div></div>
+  <div class="card"><div class="k">poll time</div><div class="v">{{.PollMs}}ms</div></div>
+{{else}}
+  <div class="card"><div class="k">status</div><div class="v">no data</div></div>
+{{end}}
+  <div class="card"><div class="k">journal</div><div class="v">{{bytes .JournalBytes}}</div></div>
+  <div class="card"><div class="k">days</div><div class="v">{{len .Days}}</div></div>
+</div>
+
+<h2>Recorded history</h2>
+<div class="cards">
+  <div class="card"><div class="k">observations</div><div class="v">{{.TotalObs}}</div></div>
+  <div class="card"><div class="k">that passed</div><div class="v">{{.PassingObs}}</div></div>
+  <div class="card"><div class="k">net 30d min</div><div class="v">{{printf "%+.0f" .NetMin}}</div></div>
+  <div class="card"><div class="k">median</div><div class="v">{{printf "%+.0f" .NetMedian}}</div></div>
+  <div class="card"><div class="k">mean</div><div class="v">{{printf "%+.0f" .NetMean}}</div></div>
+  <div class="card"><div class="k">max</div><div class="v">{{printf "%+.0f" .NetMax}}</div></div>
+</div>
+
+<div class="note">
+Net is in basis points after four fee legs and measured slippage on both books, over the stated
+hold, assuming the current rate persists for the whole period. Rates mean-revert; a high rate is
+usually payment for a risk rather than a gift. A negative median is the expected reading and is
+the finding, not a failure. Capital required is roughly twice the notional because both legs must
+be funded, so return on deployed capital is about half any figure quoted against notional.
+</div>
+
+<div class="note">
+Days on disk: {{range .Days}}{{.}} {{end}}
+</div>
+
+
+<h2>REVERSE CARRY &mdash; SHORT SPOT / LONG PERP</h2>
+{{if not .Reverse.Configured}}
+<p class="muted">Not wired. Pass <code>-reverse-data</code> to the dashboard to
+show the reverse book. This is NOT the same as "reverse has no positions".</p>
+{{else if .Reverse.Err}}
+<p class="bad">Reverse book unreadable: {{.Reverse.Err}}</p>
+{{else if not .Reverse.Started}}
+<p class="muted">Reverse book configured at <code>{{.Reverse.Dir}}</code> but it
+has written no positions.json yet. Either the service has not opened a first
+position, or it is not running.</p>
+{{else}}
+<div class="cards">
+  <div class="card"><div class="k">open</div><div class="v">{{.Reverse.OpenCount}}</div></div>
+  <div class="card"><div class="k">closed</div><div class="v">{{.Reverse.ClosedCount}}</div></div>
+  <div class="card"><div class="k">funding net of borrow</div><div class="v">{{printf "$%.3f" .Reverse.FundingUSD}}</div></div>
+  <div class="card"><div class="k">borrow paid</div><div class="v">{{printf "$%.3f" .Reverse.BorrowUSD}}</div></div>
+  <div class="card"><div class="k">round trips</div><div class="v">{{printf "$%.3f" .Reverse.CostUSD}}</div></div>
+  <div class="card"><div class="k">net</div><div class="v">{{printf "$%.3f" .Reverse.NetUSD}}</div></div>
+  <div class="card"><div class="k">capital deployed</div><div class="v">{{usd .Reverse.CapitalUSD}}</div></div>
+  <div class="card"><div class="k">return on capital</div><div class="v">{{printf "%.3f%%" .Reverse.ReturnPct}}</div></div>
+  <div class="card"><div class="k">open: in profit / underwater</div><div class="v">{{.Reverse.InProfit}} / {{.Reverse.Underwater}}</div></div>
+  <div class="card"><div class="k">closed: won / lost</div><div class="v">{{.Reverse.Won}} / {{.Reverse.Lost}}</div></div>
+  <div class="card"><div class="k">avg held</div><div class="v">{{printf "%.2f d" .Reverse.MeanHoldDays}}</div></div>
+</div>
+
+<p class="muted">Funding is shown ALREADY NET OF BORROW; the borrow column is
+what was subtracted. Exit cost on an open position is an ESTIMATE (marked ~),
+assumed symmetric with entry &mdash; a position has not made money until it has
+paid to get out. A NEGATIVE rate is what this book wants: shorts are being paid.</p>
+
+<h3>Open</h3>
+{{if .Reverse.Open}}
+<table>
+<tr><th>symbol</th><th>venue</th><th>opened</th><th>held d</th><th>rate %</th>
+<th>borrow bps/hr</th><th>funding bps</th><th>borrow bps</th>
+<th>entry bps</th><th>exit bps</th><th>net bps</th><th>net $</th><th>ret %</th></tr>
+{{range .Reverse.Open}}
+<tr>
+<td>{{.Symbol}}</td><td>{{.Venue}}</td><td>{{.OpenedAt}}</td>
+<td>{{printf "%.2f" .HeldDays}}</td>
+<td>{{printf "%.4f" .RatePct}}</td>
+<td>{{printf "%.3f" .BorrowBpsHr}}</td>
+<td>{{printf "%.2f" .NetCarryBps}}</td>
+<td>{{printf "%.2f" .BorrowPaidBps}}</td>
+<td>{{printf "%.2f" .EntryCostBps}}</td>
+<td>{{if .ExitEstimate}}~{{end}}{{printf "%.2f" .ExitCostBps}}</td>
+<td class="{{if lt .NetBps 0.0}}bad{{else}}good{{end}}">{{printf "%.2f" .NetBps}}</td>
+<td>{{printf "$%.3f" .NetUSD}}</td>
+<td>{{printf "%.3f" .ReturnPct}}</td>
+</tr>
+{{end}}
+</table>
+{{else}}
+<p class="muted">No reverse positions open. The book is running and enforcing
+its budget; it has not found a candidate that clears the borrow cost.</p>
+{{end}}
+
+<h3>Closed</h3>
+{{if .Reverse.Closed}}
+<table>
+<tr><th>symbol</th><th>venue</th><th>closed</th><th>held d</th><th>reason</th>
+<th>funding bps</th><th>borrow bps</th><th>net bps</th><th>net $</th><th>ret %</th></tr>
+{{range .Reverse.Closed}}
+<tr>
+<td>{{.Symbol}}</td><td>{{.Venue}}</td><td>{{.ClosedAt}}</td>
+<td>{{printf "%.2f" .HeldDays}}</td><td>{{.Reason}}</td>
+<td>{{printf "%.2f" .NetCarryBps}}</td>
+<td>{{printf "%.2f" .BorrowPaidBps}}</td>
+<td class="{{if lt .NetBps 0.0}}bad{{else}}good{{end}}">{{printf "%.2f" .NetBps}}</td>
+<td>{{printf "$%.3f" .NetUSD}}</td>
+<td>{{printf "%.3f" .ReturnPct}}</td>
+</tr>
+{{end}}
+</table>
+{{else}}
+<p class="muted">Nothing closed yet.</p>
+{{end}}
+{{end}}
+</body></html>
+`
